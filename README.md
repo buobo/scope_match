@@ -2,6 +2,10 @@
 <p>项目地址：<a href="https://github.com/buobo/scope_match">https://github.com/buobo/scope_match</a></p>
 <!-- /wp:paragraph -->
 
+<!-- wp:paragraph -->
+<p>项目地址：README中部分动图可以查看<a href="http://39.104.51.85/index.php/2026/04/29/scope_match-%e4%bd%bf%e7%94%a8%e8%af%b4%e6%98%8e/">http://39.104.51.85/index.php/2026/04/29/scope_match-%e4%bd%bf%e7%94%a8%e8%af%b4%e6%98%8e/</a></p>
+<!-- /wp:paragraph -->
+
 <!-- wp:heading -->
 <h2 class="wp-block-heading">插件简介</h2>
 <!-- /wp:heading -->
