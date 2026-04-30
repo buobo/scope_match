@@ -51,13 +51,12 @@ except Exception:
 
 
 PLUGIN_NAME = "Scope Sticky Braces"
-PLUGIN_VERSION = "v9-back-stack-20260429"
+PLUGIN_VERSION = "v9-back-stack-20260429-event-sources-min-backkey"
 BACK_JUMP_STACK_MAX = 10
 BACK_JUMP_STACK = []
 TARGET_LINE_BELOW_STICKY_OVERLAY = True
 TARGET_LINE_EXTRA_TOP_PADDING_ROWS = 0
 
-UPDATE_INTERVAL_MS = 160
 MAX_STICKY_LEVELS = 10
 TEXT_MAX_LEN = 180
 
@@ -1620,12 +1619,6 @@ def _strip_leading_ws_from_segments(segments):
     return result
 
 
-def _prepend_indent_segments(segments, indent_cols):
-    # Kept for compatibility with the previous internal call site.
-    # The sticky text indentation is rendered as a pixel offset in paintEvent,
-    # not by inserting artificial whitespace into the displayed text.
-    return [dict(seg) for seg in (segments or []) if seg.get("text", "")]
-
 
 def _strip_line_prefix_noise(s):
     s = str(s).strip()
@@ -1765,7 +1758,7 @@ def _make_header_segments(lines, tagged_lines, line_no, brace_pos, header, heade
         segments.append({"text": " ", "tag": None})
 
     segments.append(brace_segment)
-    segments = _prepend_indent_segments(segments, indent_cols)
+    segments = [dict(seg) for seg in (segments or []) if seg.get("text", "")]
     return _trim_segments(segments, TEXT_MAX_LEN)
 
 
@@ -1833,6 +1826,59 @@ def _colorize_tagged_line_visible_braces(tagged_line, brace_specs):
         i += 1
 
     return "".join(out)
+
+
+def _is_plugin_brace_scolor_tag(tag_value):
+    try:
+        name = _scolor_name_from_tag(tag_value)
+    except Exception:
+        name = ""
+    return name in set(BRACE_SCOLOR_SEQUENCE)
+
+
+def _strip_existing_plugin_brace_coloring_once(tagged_line):
+    raw = str(tagged_line)
+    out = []
+    i = 0
+    n = len(raw)
+
+    while i < n:
+        ch = raw[i]
+
+        if ch in ON_TAGS and i + 4 < n:
+            tag_value = raw[i + 1]
+            body_ch = raw[i + 2]
+            off_ch = raw[i + 3]
+            off_value = raw[i + 4]
+
+            if (
+                body_ch in ("{", "}")
+                and off_ch in OFF_TAGS
+                and off_value == tag_value
+                and _is_plugin_brace_scolor_tag(tag_value)
+            ):
+                out.append(body_ch)
+                i += 5
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _strip_existing_plugin_brace_coloring(tagged_line):
+    # Old versions could repeatedly wrap the same brace with another COLSTR.
+    # Strip only this plugin's one-character brace color wrappers before
+    # applying the current brace color map. Original Hex-Rays syntax tags are
+    # preserved unless they use one of the plugin's brace colors around a single brace.
+    raw = str(tagged_line)
+    for _ in range(8):
+        cleaned = _strip_existing_plugin_brace_coloring_once(raw)
+        if cleaned == raw:
+            return cleaned
+        raw = cleaned
+    return raw
 
 
 def _clamp_row_height(h):
@@ -1903,7 +1949,9 @@ class ScopeParser:
         self.tagged_lines = tagged_lines or []
         self.lvar_names = lvar_names or set()
         self.all_scopes = []
+        self.active_by_line = []
         self._parse()
+        self._build_active_index()
 
     def _make_color_index(self, sid, depth):
         return ((sid - 1) * 5 + depth * 3 + 2) % max(1, len(BRACE_SCOLOR_SEQUENCE))
@@ -1977,6 +2025,69 @@ class ScopeParser:
 
         return per_line
 
+    def _build_active_index(self):
+        line_count = len(self.lines)
+        self.active_by_line = [() for _ in range(line_count)]
+
+        if line_count <= 0 or not self.all_scopes:
+            return
+
+        starts_by_line = {}
+        ends_by_line = {}
+
+        for scope in self.all_scopes:
+            try:
+                start = max(0, min(int(scope.start), line_count - 1))
+                end = max(0, min(int(scope.end), line_count - 1))
+            except Exception:
+                continue
+
+            if end < start:
+                continue
+
+            starts_by_line.setdefault(start, []).append(scope)
+            ends_by_line.setdefault(end, []).append(scope)
+
+        active = []
+        active_ids = set()
+
+        for line_no in range(line_count):
+            for scope in starts_by_line.get(line_no, ()):
+                try:
+                    sid = int(scope.sid)
+                except Exception:
+                    sid = id(scope)
+
+                if sid in active_ids:
+                    continue
+
+                active.append(scope)
+                active_ids.add(sid)
+
+            visible = self._normalize_same_line_branches(active)
+            visible.sort(key=lambda s: (s.depth, s.start, s.brace_line, s.sid))
+            self.active_by_line[line_no] = tuple(visible)
+
+            for scope in ends_by_line.get(line_no, ()):
+                try:
+                    sid = int(scope.sid)
+                except Exception:
+                    sid = id(scope)
+
+                if sid not in active_ids:
+                    continue
+
+                active_ids.discard(sid)
+                for idx in range(len(active) - 1, -1, -1):
+                    old = active[idx]
+                    try:
+                        old_sid = int(old.sid)
+                    except Exception:
+                        old_sid = id(old)
+                    if old_sid == sid:
+                        del active[idx]
+                        break
+
     def _normalize_same_line_branches(self, active):
         if len(active) <= 1:
             return active
@@ -2006,20 +2117,16 @@ class ScopeParser:
             return ()
 
         line_no = max(0, min(line_no, len(self.lines) - 1))
-        active = []
 
-        for scope in self.all_scopes:
-            if scope.start <= line_no <= scope.end:
-                active.append(scope)
-
-        active = self._normalize_same_line_branches(active)
-        active.sort(key=lambda s: (s.depth, s.start, s.brace_line, s.sid))
+        try:
+            active = tuple(self.active_by_line[line_no])
+        except Exception:
+            active = ()
 
         if trim and len(active) > MAX_STICKY_LEVELS:
             active = active[-MAX_STICKY_LEVELS:]
 
         return tuple(active)
-
 
 class StickyOverlay(QtWidgets.QWidget):
     def __init__(self, parent, manager=None):
@@ -2039,6 +2146,8 @@ class StickyOverlay(QtWidgets.QWidget):
 
         self.font = QtGui.QFont("Consolas")
         self.font.setPointSize(9)
+        self._pressed_row_index = -1
+        self._doc_cache = {}
 
         self.hide()
 
@@ -2117,18 +2226,16 @@ class StickyOverlay(QtWidgets.QWidget):
         except Exception:
             pass
 
-        if self._schedule_jump_from_pos(event.pos()):
-            event.accept()
-        else:
+        row_index, scope = self._row_and_scope_at_pos(event.pos())
+        if scope is None:
+            self._pressed_row_index = -1
             event.ignore()
+            return
+
+        self._pressed_row_index = row_index
+        event.accept()
 
     def mouseReleaseEvent(self, event):
-        try:
-            event.accept()
-        except Exception:
-            pass
-
-    def mouseDoubleClickEvent(self, event):
         try:
             if event.button() != QtCore.Qt.LeftButton:
                 event.ignore()
@@ -2136,13 +2243,26 @@ class StickyOverlay(QtWidgets.QWidget):
         except Exception:
             pass
 
-        if self._schedule_jump_from_pos(event.pos()):
-            event.accept()
-        else:
-            event.ignore()
+        row_index, scope = self._row_and_scope_at_pos(event.pos())
+        pressed_row = self._pressed_row_index
+        self._pressed_row_index = -1
 
-    def wheelEvent(self, event):
+        if scope is not None and row_index == pressed_row:
+            if self._schedule_jump_from_pos(event.pos()):
+                event.accept()
+                return
+
         event.ignore()
+
+    def mouseDoubleClickEvent(self, event):
+        # Do not jump here. Qt double click normally also emits press/release
+        # events, so jumping in both paths pushes duplicate back-stack entries.
+        try:
+            self._pressed_row_index = -1
+            event.accept()
+        except Exception:
+            pass
+
 
     def set_row_height(self, row_height):
         self.row_height = _clamp_row_height(row_height)
@@ -2156,6 +2276,8 @@ class StickyOverlay(QtWidgets.QWidget):
     def set_scopes(self, scopes, row_height):
         self.set_row_height(row_height)
         self.scopes = scopes
+        if len(self._doc_cache) > 256:
+            self._doc_cache.clear()
 
         parent = self.parentWidget()
         if parent is None or not scopes:
@@ -2210,30 +2332,70 @@ class StickyOverlay(QtWidgets.QWidget):
         default_color = "#d0d0d0" if dark else "#121212"
 
         text_rect = self._apply_text_indent_rect(rect, scope)
-        body_html = _segments_to_html(scope.header_segments, dark=dark, default_color=default_color)
+        text_width = max(1, text_rect.width())
 
         point_size = self.font.pointSize()
         if point_size <= 0:
             point_size = 9
 
-        doc = QtGui.QTextDocument()
-        doc.setDefaultFont(self.font)
-        doc.setDocumentMargin(0)
-        doc.setTextWidth(max(1, text_rect.width()))
-        doc.setHtml(
-            '<div style="white-space:pre; font-family:%s; font-size:%dpt;">%s</div>'
-            % (
-                html.escape(self.font.family()),
-                point_size,
-                body_html,
+        try:
+            font_key = (
+                self.font.family(),
+                int(self.font.pointSize()),
+                int(self.font.pixelSize()),
+                int(self.font.weight()),
+                bool(self.font.italic()),
             )
+        except Exception:
+            font_key = ("", point_size, -1, 0, False)
+
+        try:
+            segment_key = tuple((str(seg.get("text", "")), str(seg.get("tag", ""))) for seg in scope.header_segments)
+        except Exception:
+            segment_key = tuple()
+
+        cache_key = (
+            int(getattr(scope, "sid", 0) or 0),
+            segment_key,
+            bool(dark),
+            default_color,
+            font_key,
+            text_width,
         )
+
+        doc = self._doc_cache.get(cache_key)
+        if doc is None:
+            body_html = _segments_to_html(scope.header_segments, dark=dark, default_color=default_color)
+            doc = QtGui.QTextDocument()
+            doc.setDefaultFont(self.font)
+            doc.setDocumentMargin(0)
+            doc.setTextWidth(text_width)
+            doc.setHtml(
+                '<div style="white-space:pre; font-family:%s; font-size:%dpt;">%s</div>'
+                % (
+                    html.escape(self.font.family()),
+                    point_size,
+                    body_html,
+                )
+            )
+            self._doc_cache[cache_key] = doc
+            if len(self._doc_cache) > 256:
+                # Keep the cache bounded. The next repaint will rebuild only the
+                # documents that are actually visible.
+                self._doc_cache.clear()
+                self._doc_cache[cache_key] = doc
+        else:
+            try:
+                if int(doc.textWidth()) != int(text_width):
+                    doc.setTextWidth(text_width)
+            except Exception:
+                pass
 
         p.save()
         p.setClipRect(rect)
         y = text_rect.y() + max(0, int((text_rect.height() - doc.size().height()) / 2))
         p.translate(text_rect.x(), y)
-        doc.drawContents(p, QtCore.QRectF(0, 0, text_rect.width(), text_rect.height()))
+        doc.drawContents(p, QtCore.QRectF(0, 0, text_width, text_rect.height()))
         p.restore()
 
     def _draw_label_plain(self, p, rect, scope):
@@ -2384,31 +2546,35 @@ class PseudoWidgetEventFilter(QtCore.QObject):
         if manager is None:
             return False
 
-        try:
-            if event.type() == QtCore.QEvent.KeyPress:
+        event_type = event.type()
+
+        if event_type == QtCore.QEvent.KeyPress:
+            try:
                 if manager.handle_back_key(obj, event):
                     return True
-        except Exception as e:
-            try:
-                print("[%s] back key handler failed: %s" % (PLUGIN_NAME, e))
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    print("[%s] back key handler failed: %s" % (PLUGIN_NAME, e))
+                except Exception:
+                    pass
+            return False
 
-        watched_events = {
-            QtCore.QEvent.Wheel,
+        window_events = {
             QtCore.QEvent.Resize,
             QtCore.QEvent.Show,
+            QtCore.QEvent.Hide,
             QtCore.QEvent.Move,
-            QtCore.QEvent.KeyPress,
-            QtCore.QEvent.MouseButtonPress,
-            QtCore.QEvent.MouseButtonRelease,
         }
 
-        scroll_event = getattr(QtCore.QEvent, "Scroll", None)
-        if scroll_event is not None:
-            watched_events.add(scroll_event)
+        if event_type in window_events:
+            try:
+                manager.invalidate_widget_geometry(obj)
+            except Exception:
+                pass
+            manager.request_update()
+            return False
 
-        if event.type() in watched_events:
+        if event_type == QtCore.QEvent.MouseButtonRelease:
             manager.request_update()
 
         return False
@@ -2422,16 +2588,19 @@ class ScopeStickyUIHooks(ida_kernwin.UI_Hooks):
     def current_widget_changed(self, widget, prev_widget):
         manager = self.manager_ref()
         if manager is not None:
+            manager.invalidate_widget_geometry()
             manager.request_update()
 
     def widget_visible(self, widget):
         manager = self.manager_ref()
         if manager is not None:
+            manager.invalidate_widget_geometry()
             manager.request_update()
 
     def widget_invisible(self, widget):
         manager = self.manager_ref()
         if manager is not None:
+            manager.invalidate_widget_geometry()
             manager.request_update()
 
 
@@ -2440,7 +2609,7 @@ class ScopeStickyHexraysHooks(ida_hexrays.Hexrays_Hooks):
         ida_hexrays.Hexrays_Hooks.__init__(self)
         self.manager_ref = weakref.ref(manager)
 
-    def _colorize_vu_once(self, vu):
+    def _ensure_vu_coloring_once(self, vu):
         manager = self.manager_ref()
         if manager is None or vu is None:
             return
@@ -2452,7 +2621,7 @@ class ScopeStickyHexraysHooks(ida_hexrays.Hexrays_Hooks):
 
         if cfunc is not None:
             try:
-                manager.colorize_cfunc_braces(cfunc)
+                manager.ensure_cfunc_brace_coloring(cfunc)
             except Exception:
                 pass
 
@@ -2465,24 +2634,39 @@ class ScopeStickyHexraysHooks(ida_hexrays.Hexrays_Hooks):
     def func_printed(self, cfunc):
         manager = self.manager_ref()
         if manager is not None:
+            # The primary coloring point. This is the safest time to rewrite
+            # cfunc_t::sv because Hex-Rays has just generated the pseudocode text.
             manager.colorize_cfunc_braces(cfunc)
         return 0
 
     def open_pseudocode(self, vu):
-        self._colorize_vu_once(vu)
+        self._ensure_vu_coloring_once(vu)
         return 0
 
     def refresh_pseudocode(self, vu):
-        self._colorize_vu_once(vu)
+        self._ensure_vu_coloring_once(vu)
         return 0
 
     def switch_pseudocode(self, vu):
-        self._colorize_vu_once(vu)
+        self._ensure_vu_coloring_once(vu)
         return 0
 
     def close_pseudocode(self, vu):
         manager = self.manager_ref()
         if manager is not None:
+            try:
+                cfunc = vu.cfunc
+                entry = int(cfunc.entry_ea)
+                manager._clear_brace_color_state(entry)
+            except Exception:
+                pass
+            try:
+                manager.invalidate_cache()
+                manager.invalidate_widget_geometry()
+                manager.hide_all()
+                manager._cleanup_dead_scrollbar_connections()
+            except Exception:
+                pass
             manager.request_update()
         return 0
 
@@ -2498,6 +2682,14 @@ class ScopeStickyManager:
         self.filters = {}
         self.qt_to_twidget = {}
         self.jump_in_progress = False
+        self._update_pending = False
+        self.row_height_cache = {}
+        self.scrollbar_cache = {}
+        self.gutter_geometry_cache = {}
+        self.scrollbar_signal_cache = {}
+        self.brace_color_line_count_cache = {}
+        self.brace_color_verified_tag = {}
+        self.brace_color_recolor_pending = {}
 
         self.ui_hooks = ScopeStickyUIHooks(self)
         self.ui_hooks.hook()
@@ -2509,10 +2701,8 @@ class ScopeStickyManager:
         _build_import_caches()
         self.ensure_hexrays()
 
-        self.timer = QtCore.QTimer()
-        self.timer.setInterval(UPDATE_INTERVAL_MS)
-        self.timer.timeout.connect(self.update_active)
-        self.timer.start()
+        # Event-driven refresh only. No periodic timer is created or started.
+        # Multiple refresh requests in the same Qt event loop are coalesced.
 
         print("[%s] %s manager initialized" % (PLUGIN_NAME, PLUGIN_VERSION))
         self.request_update()
@@ -2524,11 +2714,6 @@ class ScopeStickyManager:
         FUNCTION_TOKEN_KIND_CACHE.clear()
 
     def close(self):
-        try:
-            self.timer.stop()
-        except Exception:
-            pass
-
         try:
             self.ui_hooks.unhook()
         except Exception:
@@ -2559,12 +2744,84 @@ class ScopeStickyManager:
         self.gutter_overlays.clear()
         self.filters.clear()
         self.qt_to_twidget.clear()
+        self.row_height_cache.clear()
+        self._update_pending = False
+        for sb, callback in list(self.scrollbar_signal_cache.values()):
+            try:
+                sb.valueChanged.disconnect(callback)
+            except Exception:
+                pass
+
+        self.scrollbar_cache.clear()
+        self.gutter_geometry_cache.clear()
+        self.scrollbar_signal_cache.clear()
+        self.brace_color_line_count_cache.clear()
+        self.brace_color_verified_tag.clear()
+        self.brace_color_recolor_pending.clear()
 
     def request_update(self):
+        if getattr(self, "_update_pending", False):
+            return
+
+        self._update_pending = True
+        manager_ref = weakref.ref(self)
+
+        def _run_update(mref=manager_ref):
+            manager = mref()
+            if manager is None:
+                return
+
+            manager._update_pending = False
+            try:
+                manager.update_active()
+            except Exception as e:
+                try:
+                    print("[%s] update_active failed: %s" % (PLUGIN_NAME, e))
+                except Exception:
+                    pass
+
         try:
-            QtCore.QTimer.singleShot(0, self.update_active)
+            QtCore.QTimer.singleShot(0, _run_update)
         except Exception:
-            pass
+            self._update_pending = False
+
+    def _cleanup_dead_scrollbar_connections(self):
+        for key, pair in list(self.scrollbar_signal_cache.items()):
+            try:
+                scrollbar, _callback = pair
+                if scrollbar is None:
+                    self.scrollbar_signal_cache.pop(key, None)
+                    continue
+                scrollbar.maximum()
+            except Exception:
+                self.scrollbar_signal_cache.pop(key, None)
+
+    def invalidate_widget_geometry(self, widget=None):
+        self._cleanup_dead_scrollbar_connections()
+        if widget is None:
+            self.row_height_cache.clear()
+            self.scrollbar_cache.clear()
+            self.gutter_geometry_cache.clear()
+            return
+
+        candidate_ids = set()
+        cur = widget
+        for _ in range(12):
+            if cur is None:
+                break
+            try:
+                candidate_ids.add(id(cur))
+                cur = cur.parentWidget()
+            except Exception:
+                break
+
+        for cache in (self.row_height_cache, self.scrollbar_cache, self.gutter_geometry_cache):
+            for key in list(cache.keys()):
+                try:
+                    if key in candidate_ids:
+                        cache.pop(key, None)
+                except Exception:
+                    pass
 
     def ensure_hexrays(self):
         if self.hexrays_ready:
@@ -2627,6 +2884,45 @@ class ScopeStickyManager:
         widget.installEventFilter(event_filter)
         self.filters[pair_key] = event_filter
 
+    def _connect_scrollbar_value_changed(self, scrollbar):
+        """Use vertical scrollbar valueChanged as the only scroll refresh source.
+
+        This keeps scrolling event-driven without installing wheel-event filters
+        or reintroducing a periodic timer.
+        """
+        if scrollbar is None:
+            return
+
+        key = id(scrollbar)
+        cached = self.scrollbar_signal_cache.get(key)
+        if cached is not None:
+            try:
+                cached_scrollbar, _callback = cached
+                if cached_scrollbar is scrollbar:
+                    return
+            except Exception:
+                pass
+
+        manager_ref = weakref.ref(self)
+
+        def _on_scrollbar_value_changed(_value=0, mref=manager_ref):
+            manager = mref()
+            if manager is not None:
+                manager.request_update()
+
+        try:
+            scrollbar.valueChanged.connect(_on_scrollbar_value_changed)
+            self.scrollbar_signal_cache[key] = (scrollbar, _on_scrollbar_value_changed)
+        except Exception:
+            pass
+
+    def _connect_scrollbar_value_changed_many(self, scrollbars):
+        for sb in scrollbars or []:
+            try:
+                self._connect_scrollbar_value_changed(sb)
+            except Exception:
+                pass
+
     def _get_overlay(self, qt_widget):
         key = id(qt_widget)
         overlay = self.overlays.get(key)
@@ -2653,12 +2949,65 @@ class ScopeStickyManager:
                 except Exception:
                     pass
 
+    def _widget_font_cache_key(self, widget):
+        if widget is None:
+            return None
+
+        try:
+            font = widget.font()
+            return (
+                font.family(),
+                int(font.pointSize()),
+                int(font.pixelSize()),
+                int(font.weight()),
+                bool(font.italic()),
+            )
+        except Exception:
+            return None
+
+    def _cached_code_line_height(self, qt_widget):
+        key = id(qt_widget)
+        font_key = self._widget_font_cache_key(qt_widget)
+
+        cached = self.row_height_cache.get(key)
+        if cached is not None:
+            try:
+                cached_widget, cached_font_key, cached_height = cached
+                if cached_widget is qt_widget and cached_font_key == font_key:
+                    return _clamp_row_height(cached_height)
+            except Exception:
+                pass
+
+        row_height = _estimate_code_line_height(qt_widget)
+        self.row_height_cache[key] = (qt_widget, font_key, row_height)
+        return row_height
+
     def _find_gutter_host_and_rect(self, qt_widget, row_height, total_lines, scope_count):
         if qt_widget is None or scope_count <= 0:
             return None, QtCore.QRect()
 
         panel_h = max(1, int(scope_count) * _clamp_row_height(row_height))
         desired_w = _estimate_line_no_width(qt_widget, total_lines)
+        key = id(qt_widget)
+        cache_key = None
+
+        try:
+            cache_key = (
+                int(qt_widget.width()),
+                int(qt_widget.height()),
+                int(row_height),
+                int(total_lines or 0),
+                int(scope_count or 0),
+                desired_w,
+            )
+            cached = self.gutter_geometry_cache.get(key)
+            if cached is not None:
+                cached_widget, cached_key, cached_host, cached_rect = cached
+                if cached_widget is qt_widget and cached_key == cache_key:
+                    if cached_host is not None and cached_rect is not None and cached_rect.isValid():
+                        return cached_host, QtCore.QRect(cached_rect)
+        except Exception:
+            cache_key = None
 
         try:
             viewport_global = qt_widget.mapToGlobal(QtCore.QPoint(0, 0))
@@ -2689,6 +3038,11 @@ class ScopeStickyManager:
                     rect = QtCore.QRect(gutter_x, top_y, gutter_w, panel_h)
 
                     if rect.width() > 0 and rect.height() > 0:
+                        try:
+                            if cache_key is not None:
+                                self.gutter_geometry_cache[key] = (qt_widget, cache_key, parent, QtCore.QRect(rect))
+                        except Exception:
+                            pass
                         return parent, rect
             except Exception:
                 pass
@@ -2696,6 +3050,11 @@ class ScopeStickyManager:
             parent = parent.parentWidget()
             depth += 1
 
+        try:
+            if cache_key is not None:
+                self.gutter_geometry_cache[key] = (qt_widget, cache_key, None, QtCore.QRect())
+        except Exception:
+            pass
         return None, QtCore.QRect()
 
     def _get_gutter_overlay(self, host_widget, qt_widget):
@@ -2737,74 +3096,7 @@ class ScopeStickyManager:
                 pass
 
 
-    def _find_vertical_scrollbar(self, qt_widget):
-        if qt_widget is None:
-            return None
-
-        candidates = []
-        seen = set()
-
-        def add_scrollbars_from(widget):
-            if widget is None:
-                return
-            try:
-                widgets = [widget] + list(widget.findChildren(QtWidgets.QWidget))
-            except Exception:
-                widgets = [widget]
-
-            for w in widgets:
-                try:
-                    if id(w) in seen:
-                        continue
-                    seen.add(id(w))
-
-                    if isinstance(w, QtWidgets.QScrollBar):
-                        if w.orientation() == QtCore.Qt.Vertical and w.maximum() > 0:
-                            candidates.append(w)
-                        continue
-
-                    if isinstance(w, QtWidgets.QAbstractScrollArea):
-                        sb = w.verticalScrollBar()
-                        if sb is not None and sb.maximum() > 0:
-                            candidates.append(sb)
-                except Exception:
-                    pass
-
-        cur = qt_widget
-        depth = 0
-        while cur is not None and depth < 8:
-            add_scrollbars_from(cur)
-            try:
-                parent = cur.parentWidget()
-            except Exception:
-                parent = None
-            if parent is None:
-                break
-            cur = parent
-            depth += 1
-
-        unique = []
-        seen_sb = set()
-        for sb in candidates:
-            try:
-                key = id(sb)
-                if key in seen_sb:
-                    continue
-                seen_sb.add(key)
-                if sb.isVisible() and sb.maximum() > 0:
-                    unique.append(sb)
-            except Exception:
-                pass
-
-        if not unique:
-            return None
-
-        try:
-            return max(unique, key=lambda x: (x.maximum(), x.height()))
-        except Exception:
-            return unique[0]
-
-    def _find_all_vertical_scrollbars(self, qt_widget):
+    def _discover_vertical_scrollbars(self, qt_widget):
         if qt_widget is None:
             return []
 
@@ -2862,6 +3154,47 @@ class ScopeStickyManager:
 
         unique.sort(key=lambda x: (int(x.maximum()), int(x.height())), reverse=True)
         return unique
+
+    def _get_cached_vertical_scrollbars(self, qt_widget):
+        key = id(qt_widget)
+
+        cached = self.scrollbar_cache.get(key)
+        if cached is not None:
+            try:
+                cached_widget, cached_scrollbars = cached
+                if cached_widget is qt_widget:
+                    valid = []
+                    for sb in cached_scrollbars:
+                        try:
+                            if sb is not None and sb.maximum() > 0:
+                                valid.append(sb)
+                        except Exception:
+                            pass
+                    if valid:
+                        self._connect_scrollbar_value_changed_many(valid)
+                        return valid
+            except Exception:
+                pass
+
+        scrollbars = self._discover_vertical_scrollbars(qt_widget)
+        self._connect_scrollbar_value_changed_many(scrollbars)
+        self.scrollbar_cache[key] = (qt_widget, scrollbars)
+        return scrollbars
+
+    def _find_vertical_scrollbar(self, qt_widget):
+        scrollbars = self._get_cached_vertical_scrollbars(qt_widget)
+        if not scrollbars:
+            return None
+
+        for sb in scrollbars:
+            try:
+                if sb.isVisible() and sb.maximum() > 0:
+                    return sb
+            except Exception:
+                pass
+
+        return scrollbars[0]
+
 
     def _clamp_target_line(self, vu, line_no):
         try:
@@ -3085,7 +3418,7 @@ class ScopeStickyManager:
         return chosen_cover, chosen_top_line, chosen_scopes
 
     def _scroll_qt_view_to_line(self, qt_widget, line_no, total_lines, covered_rows=0):
-        scrollbars = self._find_all_vertical_scrollbars(qt_widget)
+        scrollbars = list(self._get_cached_vertical_scrollbars(qt_widget) or [])
         if not scrollbars or total_lines <= 0:
             try:
                 print("[%s] fallback Qt scrollbar not found, candidates=%d, total_lines=%d" % (
@@ -3414,7 +3747,6 @@ class ScopeStickyManager:
             return False
 
         self.jump_in_progress = True
-        timer_was_active = False
         jumped = False
         used_method = "none"
 
@@ -3463,12 +3795,8 @@ class ScopeStickyManager:
                     except Exception:
                         pass
 
-            try:
-                timer_was_active = self.timer.isActive()
-                if timer_was_active:
-                    self.timer.stop()
-            except Exception:
-                timer_was_active = False
+            # No periodic refresh timer is running in event-driven mode, so there
+            # is nothing to pause during a sticky jump.
 
             try:
                 ida_kernwin.activate_widget(twidget, True)
@@ -3516,7 +3844,7 @@ class ScopeStickyManager:
                 pass
 
             try:
-                print("[%s] %s row %s -> pseudocode line %d, post_cover=%d, predicted_top=%d, method=%s, jumped=%s, back_stack=%d" % (
+                print("[%s] %s row %s -> pseudocode line %d, post_cover=%d, predicted_top=%d, method=%s, jumped=%s" % (
                     PLUGIN_NAME,
                     str(jump_reason or "sticky"),
                     "" if clicked_row is None else str(int(clicked_row) + 1),
@@ -3525,7 +3853,6 @@ class ScopeStickyManager:
                     int(predicted_top_line) + 1,
                     used_method,
                     str(bool(jumped)),
-                    len(BACK_JUMP_STACK),
                 ))
             except Exception:
                 pass
@@ -3535,19 +3862,10 @@ class ScopeStickyManager:
             except Exception:
                 pass
 
-            try:
-                QtCore.QTimer.singleShot(100, self.request_update)
-            except Exception:
-                pass
 
             return jumped
 
         finally:
-            try:
-                if timer_was_active and not self.timer.isActive():
-                    self.timer.start()
-            except Exception:
-                pass
             self.jump_in_progress = False
 
     def _make_parser_from_cfunc(self, cfunc):
@@ -3592,43 +3910,272 @@ class ScopeStickyManager:
 
         return self.cache_parser, self.cache_total_lines
 
-    def colorize_cfunc_braces(self, cfunc):
+    def _cfunc_entry_and_total_lines(self, cfunc):
+        try:
+            entry = int(cfunc.entry_ea)
+        except Exception:
+            entry = 0
+
+        try:
+            sv = cfunc.get_pseudocode()
+            total_lines = int(len(sv))
+        except Exception:
+            sv = None
+            total_lines = 0
+
+        return entry, total_lines, sv
+
+    def _line_has_plugin_colored_brace_at(self, tagged_line, visible_pos, brace_ch, color_index=None):
+        raw = str(tagged_line)
+        try:
+            visible_pos = int(visible_pos)
+        except Exception:
+            return False
+
+        if visible_pos < 0 or brace_ch not in ("{", "}"):
+            return False
+
+        expected_tag = ""
+        if color_index is not None:
+            try:
+                expected_tag = _tag_char(_brace_scolor_value_for_index(color_index))
+            except Exception:
+                expected_tag = ""
+
+        plain = _tag_remove_clean(raw, strip=False)
+        plain_idx = 0
+        i = 0
+        n = len(raw)
+
+        while i < n:
+            ch = raw[i]
+
+            # This is the exact one-character brace wrapper produced by IDA's COLSTR:
+            # COLOR_ON + color + brace + COLOR_OFF + color.
+            if ch in ON_TAGS and i + 4 < n:
+                tag_value = raw[i + 1]
+                body_ch = raw[i + 2]
+                off_ch = raw[i + 3]
+                off_value = raw[i + 4]
+
+                if (
+                    body_ch == brace_ch
+                    and off_ch in OFF_TAGS
+                    and off_value == tag_value
+                    and _is_plugin_brace_scolor_tag(tag_value)
+                ):
+                    if plain_idx == visible_pos:
+                        # For cache/skip decisions, any color emitted by this plugin is
+                        # enough. Requiring the exact expected color is too brittle across
+                        # color-sequence changes and can cause needless recoloring.
+                        return True
+                    plain_idx += 1
+                    i += 5
+                    continue
+
+            old_i = i
+            new_i = _skip_color_or_hidden(raw, i, out=None)
+            if new_i != old_i:
+                i = new_i
+                continue
+
+            if ch in ESC_TAGS:
+                if i + 1 < n:
+                    plain_idx += 1
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if plain_idx < len(plain) and ch == plain[plain_idx]:
+                plain_idx += 1
+                i += 1
+                continue
+
+            i += 1
+
+        return False
+
+    def _first_brace_coloring_state(self, cfunc):
+        entry, total_lines, sv_probe = self._cfunc_entry_and_total_lines(cfunc)
+        if total_lines <= 0 or sv_probe is None:
+            return entry, total_lines, False, False
+
+        try:
+            scope_parser, parsed_total_lines, sv = self._make_parser_from_cfunc(cfunc)
+        except Exception:
+            return entry, total_lines, False, False
+
+        if scope_parser is None or parsed_total_lines <= 0 or sv is None:
+            return entry, total_lines, False, False
+
+        try:
+            brace_map = scope_parser.build_brace_map()
+        except Exception:
+            brace_map = {}
+
+        if not brace_map:
+            return entry, int(parsed_total_lines), False, False
+
+        try:
+            first_line = min(brace_map.keys())
+            first_specs = sorted(brace_map.get(first_line, []), key=lambda x: (int(x[0]), str(x[2])))
+            first_col, first_color_index, first_ch = first_specs[0]
+            sl = sv[first_line]
+            colored = self._line_has_plugin_colored_brace_at(str(sl.line), first_col, first_ch, first_color_index)
+            return entry, int(parsed_total_lines), True, bool(colored)
+        except Exception:
+            return entry, int(parsed_total_lines), False, False
+
+    def _clear_brace_color_state(self, entry):
+        try:
+            entry = int(entry)
+        except Exception:
+            return
+        for table_name in (
+            "brace_color_line_count_cache",
+            "brace_color_verified_tag",
+            "brace_color_recolor_pending",
+        ):
+            try:
+                getattr(self, table_name).pop(entry, None)
+            except Exception:
+                pass
+
+    def _mark_brace_color_verified(self, entry, total_lines):
+        try:
+            entry = int(entry)
+            total_lines = int(total_lines)
+        except Exception:
+            return False
+        if entry == 0 or total_lines <= 0:
+            return False
+        try:
+            self.brace_color_line_count_cache[entry] = total_lines
+            self.brace_color_verified_tag[entry] = total_lines
+            self.brace_color_recolor_pending.pop(entry, None)
+            return True
+        except Exception:
+            return False
+
+    def ensure_cfunc_brace_coloring(self, cfunc):
+        """Ensure the current cfunc text is colored with minimal rewrites.
+
+        The cache is only a fast path. It is never trusted by itself. Before a
+        visual event skips coloring, the current cfunc_t::sv is checked for the
+        first plugin-colored brace. If that brace is missing, this method invokes
+        the same idempotent coloring path used by func_printed.
+        """
+        if not ENABLE_HEXRAYS_BRACE_COLOR:
+            return False
+
+        entry, total_lines, _sv_probe = self._cfunc_entry_and_total_lines(cfunc)
+        if total_lines <= 0:
+            return False
+
+        cached_total = self.brace_color_line_count_cache.get(entry)
+        verified_total = self.brace_color_verified_tag.get(entry)
+        if (cached_total is not None and cached_total != total_lines) or (verified_total is not None and verified_total != total_lines):
+            self._clear_brace_color_state(entry)
+
+        state_entry, state_total_lines, has_brace, first_colored = self._first_brace_coloring_state(cfunc)
+        if state_entry is not None:
+            entry = state_entry
+        if state_total_lines > 0:
+            total_lines = state_total_lines
+
+        if not has_brace:
+            # No braces in this pseudocode. Nothing to color and no useful cache
+            # entry to record.
+            self._clear_brace_color_state(entry)
+            return False
+
+        if first_colored:
+            self._mark_brace_color_verified(entry, total_lines)
+            return True
+
+        # The current cfunc text is not colored. Rewrite now. This is still
+        # minimal because the rewrite only happens after a real current-text
+        # miss, not merely because an event fired.
+        return self.colorize_cfunc_braces(cfunc, force=True)
+
+    def inspect_cfunc_brace_coloring(self, vu, cfunc):
+        # Backward-compatible wrapper for older call sites. It intentionally no
+        # longer drives refresh_ctext or maintains a separate pending-refresh
+        # state. The current cfunc text is the source of truth.
+        return self.ensure_cfunc_brace_coloring(cfunc)
+
+    def colorize_cfunc_braces(self, cfunc, force=False):
         if not ENABLE_HEXRAYS_BRACE_COLOR:
             return False
         if self.in_text_coloring:
             return False
 
+        entry, current_total_lines, _ = self._cfunc_entry_and_total_lines(cfunc)
+        if current_total_lines <= 0:
+            return False
+
+        if not force:
+            cached_total = self.brace_color_line_count_cache.get(entry)
+            verified_total = self.brace_color_verified_tag.get(entry)
+            if (cached_total is not None and cached_total != current_total_lines) or (verified_total is not None and verified_total != current_total_lines):
+                self._clear_brace_color_state(entry)
+
+            try:
+                state_entry, state_total_lines, has_brace, first_colored = self._first_brace_coloring_state(cfunc)
+                if state_entry is not None:
+                    entry = state_entry
+                if state_total_lines > 0:
+                    current_total_lines = state_total_lines
+                if has_brace and first_colored and self.brace_color_line_count_cache.get(entry) == current_total_lines:
+                    self._mark_brace_color_verified(entry, current_total_lines)
+                    return False
+            except Exception:
+                pass
+
         self.in_text_coloring = True
         changed_any = False
+        processed_total_lines = current_total_lines
 
         try:
             scope_parser, total_lines, sv = self._make_parser_from_cfunc(cfunc)
+            if scope_parser is not None and total_lines > 0 and sv is not None:
+                processed_total_lines = int(total_lines)
+                brace_map = scope_parser.build_brace_map()
+                if brace_map:
+                    for line_no, brace_specs in brace_map.items():
+                        try:
+                            sl = sv[line_no]
+                            old_line = str(sl.line)
+                            base_line = _strip_existing_plugin_brace_coloring(old_line)
+                            new_line = _colorize_tagged_line_visible_braces(base_line, brace_specs)
 
-            if scope_parser is None or total_lines <= 0 or sv is None:
-                return False
-
-            brace_map = scope_parser.build_brace_map()
-            if not brace_map:
-                return False
-
-            for line_no, brace_specs in brace_map.items():
-                try:
-                    sl = sv[line_no]
-                    old_line = str(sl.line)
-                    new_line = _colorize_tagged_line_visible_braces(old_line, brace_specs)
-                    if new_line != old_line:
-                        sl.line = new_line
-                        changed_any = True
-                except Exception:
-                    pass
-
+                            if new_line != old_line:
+                                sl.line = new_line
+                                changed_any = True
+                        except Exception:
+                            pass
         finally:
             self.in_text_coloring = False
+
+        try:
+            state_entry, verified_total_lines, has_brace, first_colored = self._first_brace_coloring_state(cfunc)
+            if state_entry is not None:
+                entry = state_entry
+        except Exception:
+            verified_total_lines = processed_total_lines
+            has_brace = False
+            first_colored = False
+
+        if has_brace and first_colored and verified_total_lines > 0:
+            self._mark_brace_color_verified(entry, verified_total_lines)
+        else:
+            self._clear_brace_color_state(entry)
 
         if changed_any:
             self.invalidate_cache()
 
-        return changed_any
+        return bool(changed_any or (has_brace and first_colored))
 
     def _cursor_line(self, vu):
         try:
@@ -3645,23 +4192,9 @@ class ScopeStickyManager:
         if not USE_SCROLLBAR_TOP_LINE:
             return fallback
 
-        try:
-            scrollbars = qt_widget.findChildren(QtWidgets.QScrollBar)
-        except Exception:
+        sb = self._find_vertical_scrollbar(qt_widget)
+        if sb is None:
             return fallback
-
-        candidates = []
-        for sb in scrollbars:
-            try:
-                if sb.isVisible() and sb.orientation() == QtCore.Qt.Vertical and sb.maximum() > 0:
-                    candidates.append(sb)
-            except Exception:
-                pass
-
-        if not candidates:
-            return fallback
-
-        sb = max(candidates, key=lambda x: x.maximum())
 
         try:
             value = int(sb.value())
@@ -3872,7 +4405,7 @@ class ScopeStickyManager:
             return
 
         try:
-            row_height = _estimate_code_line_height(qt_widget)
+            row_height = self._cached_code_line_height(qt_widget)
             cursor_line = self._cursor_line(vu)
             top_line = self._scrollbar_top_line(qt_widget, total_lines, cursor_line)
             scopes, _touch_line = self._select_scopes_by_bottom_touch(parser, top_line, total_lines)
