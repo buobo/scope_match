@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # scope_sticky_braces.py
-# IDA 9.0 IDAPython plugin
+# IDA 9.2-only IDAPython plugin
 
 import os
 import re
@@ -66,11 +66,11 @@ def _get_ida_kernel_version_tuple():
 
 IDA_VERSION_MAJOR, IDA_VERSION_MINOR, IDA_VERSION_TEXT = _get_ida_kernel_version_tuple()
 IDA_GE_92 = (IDA_VERSION_MAJOR, IDA_VERSION_MINOR) >= (9, 2)
-IDA92_SAFE_MODE = IDA_GE_92
+IDA92_ONLY = True
 
 
 PLUGIN_NAME = "scope_match"
-PLUGIN_VERSION = "v21-ida90-ida92-brace-color-20260430"
+PLUGIN_VERSION = "v28-ida92-sync-90-perf-no-scan-20260501"
 BACK_JUMP_STACK_MAX = 10
 BACK_JUMP_STACK = []
 TARGET_LINE_BELOW_STICKY_OVERLAY = True
@@ -120,26 +120,14 @@ BOTTOM_TOUCH_PROMOTION = True
 ENABLE_HEXRAYS_BRACE_COLOR = True
 ENABLE_STICKY_COLORED_TEXT = True
 
-# Compatibility/performance knobs. In IDA 9.2, Hex-Rays runs on Qt6/PySide6.
-# The sticky/gutter overlay uses the v20 screen-level implementation. Brace
-# coloring is enabled for both 9.0 and 9.2, but the coloring routine is kept
-# idempotent and refresh-time recoloring is skipped on 9.2 to avoid recursive
-# Hex-Rays refresh loops.
+# IDA 9.2-only runtime knobs. Hex-Rays in IDA 9.2 uses Qt6/PySide6,
+# so this branch keeps one display strategy: a screen-level sticky overlay
+# that draws both scope text and the line-number gutter in the same widget.
 ENABLE_HEXRAYS_TEXT_REWRITE = ENABLE_HEXRAYS_BRACE_COLOR
 IDA92_SKIP_TEXT_REWRITE_ON_REFRESH = True
-UPDATE_DEBOUNCE_MS = 40 if IDA92_SAFE_MODE else 0
-TIMER_UPDATE_INTERVAL_MS = 500 if IDA92_SAFE_MODE else UPDATE_INTERVAL_MS
-# In IDA 9.2, draw the sticky text and line-number gutter in one overlay
-# parented to the stable pseudocode root widget. This keeps the row->scope
-# mapping identical to the original plugin and avoids the separate gutter widget
-# drifting to the right when focus changes.
-USE_INTEGRATED_ROOT_OVERLAY = IDA92_SAFE_MODE
-# IDA 9.2 exposes the pseudocode view as multiple Qt6 widgets. A child widget
-# cannot reliably cover the original line-number gutter if the converted widget
-# is already the inner code viewport. Therefore, on IDA 9.2 we draw the sticky
-# overlay as a small top-level tool window using global screen coordinates.
-# The jump source remains the real pseudocode widget, so row->scope mapping is unchanged.
-USE_SCREEN_STICKY_OVERLAY = IDA92_SAFE_MODE
+UPDATE_DEBOUNCE_MS = 0
+TIMER_UPDATE_INTERVAL_MS = 0
+USE_SCREEN_STICKY_OVERLAY = True
 
 BRACE_SCOLOR_SEQUENCE = [
     "SCOLOR_NUMBER",
@@ -204,35 +192,37 @@ IMPORT_EA_CACHE = None
 FUNCTION_TOKEN_KIND_CACHE = {}
 
 
-# IDA 9.2 moved to Qt6/PySide6. Prefer PySide6 there; keep PyQt5 first on IDA 9.0/9.1.
+# IDA 9.2-only build. IDA 9.2 uses Qt6/PySide6, so keep one Qt binding
+# and use Hex-Rays' generic TWidgetToQtPythonWidget path instead of the older
+# TWidgetToPySideWidget path that still looks for ctx.QtGui.QWidget.
 QtCore = None
 QtGui = None
 QtWidgets = None
 QT_BINDING = None
 
-if IDA_GE_92:
-    try:
-        from PySide6 import QtCore, QtGui, QtWidgets
-        QT_BINDING = "PySide6"
-    except Exception:
-        QtCore = None
-        QtGui = None
-        QtWidgets = None
-        QT_BINDING = None
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+    QT_BINDING = "PySide6"
+except Exception:
+    QtCore = None
+    QtGui = None
+    QtWidgets = None
+    QT_BINDING = None
 
-if QtCore is None:
+try:
+    import shiboken6
+except Exception:
+    shiboken6 = None
+
+DEBUG_LOG = True
+
+def _debug(msg):
+    if not DEBUG_LOG:
+        return
     try:
-        from PyQt5 import QtCore, QtGui, QtWidgets
-        QT_BINDING = "PyQt5"
+        print("[%s] %s" % (PLUGIN_NAME, msg))
     except Exception:
-        try:
-            from PySide6 import QtCore, QtGui, QtWidgets
-            QT_BINDING = "PySide6"
-        except Exception:
-            QtCore = None
-            QtGui = None
-            QtWidgets = None
-            QT_BINDING = None
+        pass
 
 
 def _const_value(name, fallback=None):
@@ -2529,194 +2519,6 @@ class StickyOverlay(QtWidgets.QWidget):
         p.end()
 
 
-class GutterLineOverlay(QtWidgets.QWidget):
-    def __init__(self, parent, manager=None, jump_source_widget=None):
-        super().__init__(parent)
-        self.manager_ref = weakref.ref(manager) if manager is not None else (lambda: None)
-        self.jump_source_widget_ref = weakref.ref(jump_source_widget) if jump_source_widget is not None else (lambda: None)
-        self.scopes = ()
-        self.row_height = ROW_HEIGHT_DEFAULT
-        self.total_lines = 0
-        self.font = QtGui.QFont("Consolas")
-        self.font.setPointSize(9)
-        self._last_scope_key = None
-        self._last_geometry_key = None
-        self._last_row_height = None
-        self.integrated_gutter_width = 0
-        self.integrated_text_offset = 0
-        self.integrated_draw_gutter = False
-        self._screen_overlay = False
-        self.jump_source_widget_ref = weakref.ref(parent) if parent is not None else (lambda: None)
-
-        self.setWindowFlags(QtCore.Qt.Widget)
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
-        try:
-            self.setCursor(QtCore.Qt.PointingHandCursor)
-        except Exception:
-            pass
-        self.hide()
-
-    def set_jump_source_widget(self, jump_source_widget):
-        try:
-            self.jump_source_widget_ref = weakref.ref(jump_source_widget) if jump_source_widget is not None else (lambda: None)
-        except Exception:
-            self.jump_source_widget_ref = lambda: None
-
-    def _row_and_scope_at_pos(self, pos):
-        if not self.scopes:
-            return -1, None
-        try:
-            y = int(pos.y())
-        except Exception:
-            return -1, None
-        if y < 0:
-            return -1, None
-        row_h = max(1, _clamp_row_height(self.row_height))
-        row_index = int(y // row_h)
-        if row_index < 0 or row_index >= len(self.scopes):
-            return -1, None
-        return row_index, self.scopes[row_index]
-
-    def _schedule_jump_from_pos(self, pos):
-        row_index, scope = self._row_and_scope_at_pos(pos)
-        if scope is None:
-            return False
-        manager = self.manager_ref()
-        if manager is None:
-            return False
-        try:
-            target_line = int(getattr(scope, "start", -1))
-        except Exception:
-            target_line = -1
-        if target_line < 0:
-            try:
-                target_line = int(getattr(scope, "brace_line", -1))
-            except Exception:
-                target_line = -1
-        if target_line < 0:
-            return False
-        try:
-            source_widget = self.jump_source_widget_ref()
-        except Exception:
-            source_widget = None
-        if source_widget is None:
-            source_widget = self.parentWidget()
-        if source_widget is None:
-            return False
-
-        def _do_jump_request(m=manager, w=source_widget, line=target_line, row=row_index):
-            try:
-                m.jump_to_sticky_target_line(w, line, row)
-            except Exception as e:
-                try:
-                    print("[%s] gutter jump UI request failed: %s" % (PLUGIN_NAME, e))
-                except Exception:
-                    pass
-            return False
-
-        try:
-            ida_kernwin.execute_ui_requests((_do_jump_request,))
-        except Exception:
-            try:
-                QtCore.QTimer.singleShot(0, lambda m=manager, w=source_widget, line=target_line, row=row_index: m.jump_to_sticky_target_line(w, line, row))
-            except Exception:
-                pass
-        return True
-
-    def mousePressEvent(self, event):
-        try:
-            if event.button() != QtCore.Qt.LeftButton:
-                event.ignore()
-                return
-        except Exception:
-            pass
-        if self._schedule_jump_from_pos(event.pos()):
-            event.accept()
-        else:
-            event.ignore()
-
-    def mouseReleaseEvent(self, event):
-        try:
-            event.accept()
-        except Exception:
-            pass
-
-    def mouseDoubleClickEvent(self, event):
-        try:
-            if event.button() != QtCore.Qt.LeftButton:
-                event.ignore()
-                return
-        except Exception:
-            pass
-        if self._schedule_jump_from_pos(event.pos()):
-            event.accept()
-        else:
-            event.ignore()
-
-    def wheelEvent(self, event):
-        event.ignore()
-
-    def set_scopes(self, scopes, row_height, total_lines, geom_rect, source_font=None):
-        self.scopes = scopes
-        self.row_height = _clamp_row_height(row_height)
-        self.total_lines = max(0, int(total_lines or 0))
-        if source_font is not None:
-            try:
-                self.font = QtGui.QFont(source_font)
-            except Exception:
-                pass
-        parent = self.parentWidget()
-        if parent is None or not scopes:
-            if self.isVisible():
-                self.hide()
-            self._last_scope_key = None
-            self._last_geometry_key = None
-            self._last_row_height = None
-            return
-        geometry_key = (int(geom_rect.x()), int(geom_rect.y()), int(geom_rect.width()), int(geom_rect.height()))
-        scope_key = tuple((int(getattr(s, "sid", -1)), int(getattr(s, "start", -1)), int(getattr(s, "end", -1))) for s in scopes)
-        row_key = int(self.row_height)
-        if self.isVisible() and self._last_scope_key == scope_key and self._last_geometry_key == geometry_key and self._last_row_height == row_key:
-            return
-        self._last_scope_key = scope_key
-        self._last_geometry_key = geometry_key
-        self._last_row_height = row_key
-        current_rect = self.geometry()
-        if (current_rect.x(), current_rect.y(), current_rect.width(), current_rect.height()) != geometry_key:
-            self.setGeometry(geom_rect)
-        self.raise_()
-        if not self.isVisible():
-            self.show()
-        self.update()
-
-    def paintEvent(self, event):
-        if not self.scopes:
-            return
-        p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        p.setFont(self.font)
-        bg = QtGui.QColor(255, 255, 255, LINE_NO_OVERLAY_BG_ALPHA)
-        border = QtGui.QColor(LINE_NO_OVERLAY_BORDER)
-        text_color = QtGui.QColor(LINE_NO_OVERLAY_COLOR)
-        separator = QtGui.QColor(LINE_NO_OVERLAY_SEPARATOR)
-        panel_h = len(self.scopes) * self.row_height
-        panel_rect = QtCore.QRect(0, 0, self.width(), panel_h)
-        p.fillRect(panel_rect, bg)
-        p.setPen(QtGui.QPen(border, 1))
-        p.drawRect(panel_rect)
-        for idx, scope in enumerate(self.scopes):
-            row_y = idx * self.row_height
-            row_h = self.row_height
-            if idx > 0:
-                p.setPen(QtGui.QPen(separator, 1))
-                p.drawLine(0, row_y, self.width() - 1, row_y)
-            rect = QtCore.QRect(LINE_NO_OVERLAY_LEFT_PAD, row_y, max(1, self.width() - LINE_NO_OVERLAY_LEFT_PAD - LINE_NO_OVERLAY_RIGHT_PAD), row_h)
-            p.setPen(text_color)
-            p.drawText(rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, str(int(scope.start) + 1))
-        p.end()
-
 
 class PseudoWidgetEventFilter(QtCore.QObject):
     def __init__(self, manager):
@@ -2738,22 +2540,17 @@ class PseudoWidgetEventFilter(QtCore.QObject):
             except Exception:
                 pass
 
-        if IDA92_SAFE_MODE:
-            watched_events = {
-                QtCore.QEvent.Wheel,
-                QtCore.QEvent.Resize,
-                QtCore.QEvent.KeyPress,
-            }
-        else:
-            watched_events = {
-                QtCore.QEvent.Wheel,
-                QtCore.QEvent.Resize,
-                QtCore.QEvent.Show,
-                QtCore.QEvent.Move,
-                QtCore.QEvent.KeyPress,
-                QtCore.QEvent.MouseButtonPress,
-                QtCore.QEvent.MouseButtonRelease,
-            }
+        # Same event-driven update surface as the IDA 9.0 branch.
+        # No periodic timer scan is used here.
+        watched_events = {
+            QtCore.QEvent.Wheel,
+            QtCore.QEvent.Resize,
+            QtCore.QEvent.Show,
+            QtCore.QEvent.Move,
+            QtCore.QEvent.KeyPress,
+            QtCore.QEvent.MouseButtonPress,
+            QtCore.QEvent.MouseButtonRelease,
+        }
 
         scroll_event = getattr(QtCore.QEvent, "Scroll", None)
         if scroll_event is not None:
@@ -2827,7 +2624,7 @@ class ScopeStickyHexraysHooks(ida_hexrays.Hexrays_Hooks):
         # On IDA 9.2, avoid rewriting sv.line from the refresh callback itself.
         # func_printed/open/switch still color the pseudocode, and this keeps
         # Qt6/Hex-Rays from entering a refresh-colorize-refresh loop.
-        self._colorize_vu_once(vu, allow_text_rewrite=not (IDA92_SAFE_MODE and IDA92_SKIP_TEXT_REWRITE_ON_REFRESH))
+        self._colorize_vu_once(vu, allow_text_rewrite=not IDA92_SKIP_TEXT_REWRITE_ON_REFRESH)
         return 0
 
     def switch_pseudocode(self, vu):
@@ -2848,11 +2645,13 @@ class ScopeStickyManager:
         self.cache_total_lines = 0
 
         self.overlays = {}
-        self.gutter_overlays = {}
         self.filters = {}
         self.qt_to_twidget = {}
         self.overlay_to_root = {}
         self.root_to_overlay_parent = {}
+        self._row_height_cache = {}
+        self._scrollbar_cache = {}
+        self._converter_error_once = set()
         self.jump_in_progress = False
         self.update_pending = False
         self.in_update_active = False
@@ -2867,10 +2666,7 @@ class ScopeStickyManager:
         _build_import_caches()
         self.ensure_hexrays()
 
-        self.timer = QtCore.QTimer()
-        self.timer.setInterval(TIMER_UPDATE_INTERVAL_MS)
-        self.timer.timeout.connect(self.request_update)
-        self.timer.start()
+        # No periodic timer scan: updates are driven by UI/Hex-Rays events.
 
         print("[%s] %s manager initialized" % (PLUGIN_NAME, PLUGIN_VERSION))
         self.request_update()
@@ -2882,11 +2678,6 @@ class ScopeStickyManager:
         FUNCTION_TOKEN_KIND_CACHE.clear()
 
     def close(self):
-        try:
-            self.timer.stop()
-        except Exception:
-            pass
-
         try:
             self.ui_hooks.unhook()
         except Exception:
@@ -2906,18 +2697,13 @@ class ScopeStickyManager:
             except Exception:
                 pass
 
-        for overlay in list(self.gutter_overlays.values()):
-            try:
-                overlay.hide()
-                overlay.deleteLater()
-            except Exception:
-                pass
 
         self.overlays.clear()
-        self.gutter_overlays.clear()
         self.filters.clear()
         self.qt_to_twidget.clear()
         self.root_to_overlay_parent.clear()
+        self._row_height_cache.clear()
+        self._scrollbar_cache.clear()
         self.overlay_to_root.clear()
 
     def request_update(self, *args, **kwargs):
@@ -2982,51 +2768,108 @@ class ScopeStickyManager:
             except Exception:
                 pass
 
-        for overlay in list(self.gutter_overlays.values()):
-            try:
-                overlay.hide()
-            except Exception:
-                pass
 
-    def _twidget_to_qwidget(self, twidget):
-        # IDA 9.0 is Qt5/PyQt5 based. IDA 9.2 is Qt6/PySide6 based, but
-        # some builds still expose PyQt compatibility conversion helpers. Try
-        # the binding-native conversion first, then fall back to the other one.
-        converters = []
+    def _log_converter_error_once(self, message):
         try:
-            if QT_BINDING == "PySide6":
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPySideWidget", None))
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPyQtWidget", None))
-            elif QT_BINDING == "PyQt5":
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPyQtWidget", None))
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPySideWidget", None))
-            else:
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPySideWidget", None))
-                converters.append(getattr(ida_kernwin.PluginForm, "TWidgetToPyQtWidget", None))
+            key = str(message)
+            if key in self._converter_error_once:
+                return
+            self._converter_error_once.add(key)
         except Exception:
-            converters = []
+            pass
+        _debug("TWidget converter failed: %s" % message)
 
-        seen = set()
-        for conv in converters:
-            if not callable(conv):
-                continue
-            try:
-                if id(conv) in seen:
-                    continue
-                seen.add(id(conv))
-            except Exception:
-                pass
-            try:
-                w = conv(twidget)
-                if w is not None:
-                    return w
-            except Exception:
-                pass
+    def _twidget_ptr_value(self, twidget):
+        if twidget is None:
+            return 0
 
+        try:
+            if type(twidget).__name__ == "SwigPyObject":
+                return int(twidget)
+        except Exception:
+            pass
+
+        try:
+            import ctypes
+            ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+            ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+            ptr = ctypes.pythonapi.PyCapsule_GetPointer(twidget, ida_kernwin.PluginForm.VALID_CAPSULE_NAME)
+            return int(ptr or 0)
+        except Exception:
+            pass
+
+        try:
+            return int(twidget)
+        except Exception:
+            return 0
+
+    def _wrap_twidget_ptr_as_qwidget(self, twidget):
+        if QtWidgets is None or shiboken6 is None:
+            return None
+
+        ptr = self._twidget_ptr_value(twidget)
+        if not ptr:
+            return None
+
+        try:
+            widget = shiboken6.Shiboken.wrapInstance(ptr, QtWidgets.QWidget)
+        except Exception:
+            try:
+                widget = shiboken6.wrapInstance(ptr, QtWidgets.QWidget)
+            except Exception as e:
+                self._log_converter_error_once("shiboken wrap failed: %s" % e)
+                return None
+
+        if widget is not None and self._qt_widget_alive(widget):
+            return widget
         return None
 
+    def _twidget_to_qwidget(self, twidget):
+        # IDA 9.2 clean path:
+        # 1. Prefer PluginForm.TWidgetToQtPythonWidget, the generic Qt6-aware
+        #    converter in the 9.2 IDAPython wrapper.
+        # 2. Never call TWidgetToPySideWidget: affected 9.2 builds still call
+        #    ctx.QtGui.QWidget.FromCapsule, which breaks under PySide6.
+        # 3. If the generic converter is unavailable, wrap the TWidget pointer
+        #    through shiboken6 directly using QtWidgets.QWidget.
+        if twidget is None or QtWidgets is None:
+            return None
+
+        conv = getattr(ida_kernwin.PluginForm, "TWidgetToQtPythonWidget", None)
+        if callable(conv):
+            try:
+                widget = conv(twidget)
+                if widget is not None and self._qt_widget_alive(widget):
+                    return widget
+            except Exception as e:
+                self._log_converter_error_once("TWidgetToQtPythonWidget failed: %s" % e)
+
+        widget = self._wrap_twidget_ptr_as_qwidget(twidget)
+        if widget is not None:
+            return widget
+
+        self._log_converter_error_once("no live QWidget from TWidget")
+        return None
+
+    def _qt_widget_alive(self, widget):
+        if widget is None:
+            return False
+        if shiboken6 is not None:
+            try:
+                if not shiboken6.isValid(widget):
+                    return False
+            except Exception:
+                pass
+        try:
+            widget.objectName()
+        except RuntimeError:
+            return False
+        except Exception:
+            pass
+        return True
+
     def _is_child_of(self, child, root):
-        if child is None or root is None:
+        if not self._qt_widget_alive(child) or not self._qt_widget_alive(root):
             return False
         w = child
         depth = 0
@@ -3041,7 +2884,7 @@ class ScopeStickyManager:
         return False
 
     def _widget_score_for_overlay_parent(self, w):
-        if w is None:
+        if not self._qt_widget_alive(w):
             return -1
         try:
             if isinstance(w, (QtWidgets.QScrollBar, QtWidgets.QMenuBar, QtWidgets.QStatusBar)):
@@ -3090,16 +2933,19 @@ class ScopeStickyManager:
         return score
 
     def _select_overlay_parent(self, root_widget):
-        if root_widget is None:
+        if not self._qt_widget_alive(root_widget):
             return None
 
         cache_key = id(root_widget)
         cached = self.root_to_overlay_parent.get(cache_key)
         if cached is not None:
             try:
-                if cached.isVisible() and self._is_child_of(cached, root_widget):
-                    if self._widget_score_for_overlay_parent(cached) > 0:
-                        return cached
+                # Match the 9.0 event-driven behavior: once a stable overlay
+                # parent is found, reuse it until Qt reports it is gone or it
+                # no longer belongs to the current pseudocode root.  Do not
+                # rescore the child tree on every scroll event.
+                if self._qt_widget_alive(cached) and cached.isVisible() and self._is_child_of(cached, root_widget):
+                    return cached
             except Exception:
                 pass
             try:
@@ -3118,8 +2964,10 @@ class ScopeStickyManager:
         except Exception:
             root_w = 0
         for child in children:
+            if not self._qt_widget_alive(child):
+                continue
             try:
-                if isinstance(child, (StickyOverlay, GutterLineOverlay, QtWidgets.QScrollBar)):
+                if isinstance(child, (StickyOverlay, QtWidgets.QScrollBar)):
                     continue
             except Exception:
                 pass
@@ -3217,7 +3065,7 @@ class ScopeStickyManager:
             return None
 
     def _install_filter_once(self, widget, key):
-        if widget is None:
+        if not self._qt_widget_alive(widget):
             return
 
         pair_key = (id(widget), key)
@@ -3225,10 +3073,17 @@ class ScopeStickyManager:
             return
 
         event_filter = PseudoWidgetEventFilter(self)
-        widget.installEventFilter(event_filter)
+        try:
+            widget.installEventFilter(event_filter)
+        except RuntimeError:
+            return
+        except Exception:
+            return
         self.filters[pair_key] = event_filter
 
     def _get_overlay(self, qt_widget, top_level=False):
+        if not self._qt_widget_alive(qt_widget):
+            return None
         key = ("screen", id(qt_widget)) if top_level else id(qt_widget)
         overlay = self.overlays.get(key)
 
@@ -3263,312 +3118,6 @@ class ScopeStickyManager:
 
         self._install_filter_once(qt_widget, ("main", key))
         return overlay
-
-    def _line_gutter_width_for_root_overlay(self, code_widget, total_lines):
-        try:
-            return max(LINE_NO_OVERLAY_MIN_WIDTH, _estimate_line_no_width(code_widget, total_lines))
-        except Exception:
-            return LINE_NO_OVERLAY_MIN_WIDTH
-
-    def _widget_global_rect_in_root(self, root_widget, widget):
-        try:
-            p0 = root_widget.mapFromGlobal(widget.mapToGlobal(QtCore.QPoint(0, 0)))
-            return QtCore.QRect(int(p0.x()), int(p0.y()), int(widget.width()), int(widget.height()))
-        except Exception:
-            return QtCore.QRect()
-
-    def _candidate_name_for_widget(self, widget):
-        try:
-            cls = str(widget.metaObject().className()).lower()
-        except Exception:
-            cls = ""
-        try:
-            obj = str(widget.objectName()).lower()
-        except Exception:
-            obj = ""
-        return cls + " " + obj
-
-    def _find_code_text_anchor_widget(self, root_widget, fallback_widget):
-        """Return the stable widget whose left edge is closest to the real code text.
-
-        IDA 9.2 exposes more Qt6 child widgets than IDA 9.0.  Some of those
-        children are transient focus/tooltip/scroll-area panels; if one of them
-        is used as the geometry anchor, the overlay may jump to the right side
-        after a click.  This routine anchors only on visible pseudocode/memo-like
-        widgets that live near the left side of the pseudocode view.
-        """
-        if root_widget is None:
-            return fallback_widget
-
-        try:
-            root_w = int(root_widget.width())
-            root_h = int(root_widget.height())
-        except Exception:
-            root_w = 0
-            root_h = 0
-
-        best = None
-        best_score = -10**18
-
-        candidates = []
-        if fallback_widget is not None:
-            candidates.append(fallback_widget)
-        try:
-            candidates.extend(root_widget.findChildren(QtWidgets.QWidget))
-        except Exception:
-            pass
-
-        seen = set()
-        for w in candidates:
-            if w is None:
-                continue
-            try:
-                wid = id(w)
-                if wid in seen:
-                    continue
-                seen.add(wid)
-            except Exception:
-                pass
-
-            try:
-                if isinstance(w, (StickyOverlay, GutterLineOverlay, QtWidgets.QScrollBar)):
-                    continue
-            except Exception:
-                pass
-
-            try:
-                if not w.isVisible():
-                    continue
-                ww = int(w.width())
-                wh = int(w.height())
-            except Exception:
-                continue
-
-            if ww < 180 or wh < 80:
-                continue
-
-            rect = self._widget_global_rect_in_root(root_widget, w)
-            if not rect.isValid():
-                continue
-
-            x = int(rect.x())
-            y = int(rect.y())
-            width = int(rect.width())
-            height = int(rect.height())
-
-            # The real text area in the pseudocode view should be near the top
-            # and not start in the far-right part of the dock.  This is the key
-            # guard that prevents the overlay line numbers from drifting right.
-            if y < -8 or y > max(80, GUTTER_DETECT_MAX_TOP * 3):
-                continue
-            if root_w > 0 and x > max(260, int(root_w * 0.35)):
-                continue
-
-            score = 0
-            name_blob = self._candidate_name_for_widget(w)
-            if "customidamemo" in name_blob or "idamemo" in name_blob:
-                score += 100000000
-            if "pseudocode" in name_blob:
-                score += 50000000
-            if "viewer" in name_blob or "view" in name_blob:
-                score += 10000000
-
-            if root_w > 0:
-                if width >= int(root_w * 0.45):
-                    score += 20000000
-                if width >= int(root_w * 0.65):
-                    score += 10000000
-
-            # Prefer a text anchor with a left gutter before it.  In the usual
-            # IDA pseudocode view, this x is exactly the end of the line-number
-            # column, so line numbers should be drawn at x - gutter_width.
-            if LINE_NO_OVERLAY_MIN_WIDTH <= x <= max(220, GUTTER_DETECT_MAX_LEFT * 2):
-                score += 80000000
-                score -= abs(x - 96) * 1000
-            elif 0 <= x < LINE_NO_OVERLAY_MIN_WIDTH:
-                score += 1000000
-            else:
-                score -= 50000000
-
-            if y <= GUTTER_DETECT_MAX_TOP:
-                score += 3000000
-
-            if height >= max(100, int(root_h * 0.45)):
-                score += 5000000
-
-            if score > best_score:
-                best_score = score
-                best = w
-
-        if best is not None:
-            return best
-        return fallback_widget if fallback_widget is not None else root_widget
-
-    def _select_true_gutter_overlay_host(self, root_widget, code_widget):
-        """Return (host, code_x, code_y) for the IDA 9.2 integrated overlay.
-
-        In IDA 9.2, PluginForm.TWidgetToPySideWidget may return the inner
-        code/memo widget instead of the whole pseudocode memo that contains the
-        marker column and the line-number column.  A child overlay cannot cover
-        its parent's left siblings, so the overlay must be parented to the first
-        stable ancestor that still contains the original line-number gutter.
-        """
-        if code_widget is None:
-            code_widget = root_widget
-        if root_widget is None:
-            root_widget = code_widget
-
-        best_host = root_widget
-        best_x = 0
-        best_y = 0
-        best_score = -10**18
-
-        try:
-            code_global = code_widget.mapToGlobal(QtCore.QPoint(0, 0))
-            code_w = int(code_widget.width())
-            code_h = int(code_widget.height())
-        except Exception:
-            code_global = None
-            code_w = 0
-            code_h = 0
-
-        cur = code_widget
-        depth = 0
-        while cur is not None and depth < 12:
-            try:
-                if isinstance(cur, (StickyOverlay, GutterLineOverlay, QtWidgets.QScrollBar)):
-                    raise RuntimeError("skip helper widget")
-            except Exception:
-                pass
-
-            try:
-                if code_global is not None:
-                    local = cur.mapFromGlobal(code_global)
-                    code_x = int(local.x())
-                    code_y = int(local.y())
-                else:
-                    code_x = 0
-                    code_y = 0
-                host_w = int(cur.width())
-                host_h = int(cur.height())
-                visible = bool(cur.isVisible())
-            except Exception:
-                visible = False
-                host_w = 0
-                host_h = 0
-                code_x = 0
-                code_y = 0
-
-            if visible and host_w > 120 and host_h > 80:
-                score = 0
-
-                # We want an ancestor where the code widget starts after a real
-                # left gutter.  This usually falls around 70-130 px in IDA 9.2.
-                if LINE_NO_OVERLAY_MIN_WIDTH <= code_x <= max(240, GUTTER_DETECT_MAX_LEFT * 2):
-                    score += 200000000
-                    score -= abs(code_x - 100) * 10000
-                elif 20 <= code_x < LINE_NO_OVERLAY_MIN_WIDTH:
-                    score += 20000000
-                else:
-                    score -= 100000000
-
-                # The host should contain the code area horizontally and should
-                # be vertically aligned with it.
-                if host_w >= code_x + max(100, min(code_w, 300)):
-                    score += 20000000
-                if -8 <= code_y <= max(80, GUTTER_DETECT_MAX_TOP * 3):
-                    score += 10000000
-                else:
-                    score -= 20000000
-                if code_h > 0 and host_h >= min(code_h, 100):
-                    score += 5000000
-
-                name_blob = self._candidate_name_for_widget(cur)
-                if "customidamemo" in name_blob or "idamemo" in name_blob:
-                    score += 8000000
-                if "pseudocode" in name_blob:
-                    score += 4000000
-                if "viewer" in name_blob or "view" in name_blob:
-                    score += 2000000
-
-                # Avoid accidentally choosing the whole IDA main window.  It is
-                # much wider/taller and gives unstable coordinates after docking.
-                try:
-                    if cur.isWindow():
-                        score -= 50000000
-                except Exception:
-                    pass
-
-                if score > best_score:
-                    best_score = score
-                    best_host = cur
-                    best_x = code_x
-                    best_y = code_y
-
-            try:
-                parent = cur.parentWidget()
-            except Exception:
-                parent = None
-            if parent is None:
-                break
-            cur = parent
-            depth += 1
-
-        if best_host is None:
-            best_host = root_widget if root_widget is not None else code_widget
-            best_x = 0
-            best_y = 0
-        return best_host, int(max(0, best_x)), int(max(0, best_y))
-
-    def _make_root_overlay_geometry(self, host_widget, code_widget, row_height, scope_count, total_lines, code_x=None, code_y=None):
-        """Return geometry for the IDA 9.2 integrated overlay.
-
-        v19 draws the overlay from the original line-number column instead of
-        anchoring it to the inner code widget.  The line-number band is placed
-        immediately before the real code left edge, so it covers IDA's original
-        line numbers while leaving the blue marker column alone whenever the
-        host exposes it separately.
-        """
-        panel_h = max(1, int(scope_count or 0) * _clamp_row_height(row_height))
-
-        try:
-            host_w = int(host_widget.width())
-        except Exception:
-            host_w = 0
-
-        try:
-            code_x = int(code_x if code_x is not None else 0)
-        except Exception:
-            code_x = 0
-        try:
-            code_y = int(code_y if code_y is not None else 0)
-        except Exception:
-            code_y = 0
-
-        estimated_line_no_w = self._line_gutter_width_for_root_overlay(code_widget, total_lines)
-        line_no_w = max(
-            LINE_NO_OVERLAY_MIN_WIDTH,
-            min(int(estimated_line_no_w), LINE_NO_OVERLAY_MAX_WIDTH),
-        )
-
-        # The overlay starts at the original line-number column, not at the blue
-        # marker column and not at the code text column.
-        if code_x > line_no_w:
-            overlay_x = max(0, code_x - line_no_w - 2)
-        else:
-            overlay_x = 0
-
-        overlay_y = max(0, code_y)
-        gutter_w = max(1, code_x - overlay_x)
-        text_offset = gutter_w + 4
-
-        if host_w <= 0:
-            overlay_w = max(260, text_offset + 600)
-        else:
-            overlay_w = max(260, host_w - overlay_x)
-
-        rect = QtCore.QRect(int(overlay_x), int(overlay_y), int(max(1, overlay_w)), int(panel_h))
-        return rect, int(max(0, gutter_w)), int(max(0, text_offset))
 
     def _make_screen_overlay_geometry(self, code_widget, row_height, scope_count, total_lines):
         """Return global-screen geometry for the IDA 9.2 sticky overlay.
@@ -3616,121 +3165,6 @@ class ScopeStickyManager:
                     overlay.hide()
                 except Exception:
                     pass
-
-        for key, overlay in list(self.gutter_overlays.items()):
-            if key != current_key:
-                try:
-                    overlay.hide()
-                except Exception:
-                    pass
-
-    def _find_gutter_host_and_rect(self, qt_widget, row_height, total_lines, scope_count, root_widget=None):
-        if qt_widget is None or scope_count <= 0:
-            return None, QtCore.QRect()
-
-        panel_h = max(1, int(scope_count) * _clamp_row_height(row_height))
-        desired_w = _estimate_line_no_width(qt_widget, total_lines)
-
-        # IDA 9.2 often exposes an inner memo widget for code text. The original
-        # line-number gutter belongs to the converted root widget. Prefer placing
-        # the gutter overlay on the root and ending it where the code memo begins.
-        if root_widget is not None and root_widget is not qt_widget:
-            try:
-                code_origin_global = qt_widget.mapToGlobal(QtCore.QPoint(0, 0))
-                code_origin_in_root = root_widget.mapFromGlobal(code_origin_global)
-                code_x = int(code_origin_in_root.x())
-                code_y = int(code_origin_in_root.y())
-                max_left = max(220, GUTTER_DETECT_MAX_LEFT * 2)
-                if code_x > 0 and code_x <= max_left and code_y >= 0 and code_y <= GUTTER_DETECT_MAX_TOP:
-                    gutter_w = min(desired_w, code_x)
-                    gutter_x = max(0, code_x - gutter_w)
-                    rect = QtCore.QRect(gutter_x, code_y, gutter_w, panel_h)
-                    if rect.width() > 0 and rect.height() > 0:
-                        return root_widget, rect
-                return None, QtCore.QRect()
-            except Exception:
-                return None, QtCore.QRect()
-
-        try:
-            viewport_global = qt_widget.mapToGlobal(QtCore.QPoint(0, 0))
-        except Exception:
-            return None, QtCore.QRect()
-
-        parent = qt_widget.parentWidget()
-        depth = 0
-
-        while parent is not None and depth < GUTTER_DETECT_MAX_DEPTH:
-            try:
-                if parent.isWindow():
-                    break
-
-                local = parent.mapFromGlobal(viewport_global)
-                left_available = int(local.x())
-                top_y = int(local.y())
-
-                if (
-                    left_available >= max(10, desired_w // 2)
-                    and left_available <= GUTTER_DETECT_MAX_LEFT
-                    and top_y >= 0
-                    and top_y <= GUTTER_DETECT_MAX_TOP
-                    and parent.width() >= left_available + max(32, qt_widget.width() // 2)
-                ):
-                    gutter_w = min(desired_w, left_available)
-                    gutter_x = max(0, left_available - gutter_w)
-                    rect = QtCore.QRect(gutter_x, top_y, gutter_w, panel_h)
-
-                    if rect.width() > 0 and rect.height() > 0:
-                        return parent, rect
-            except Exception:
-                pass
-
-            parent = parent.parentWidget()
-            depth += 1
-
-        return None, QtCore.QRect()
-
-    def _get_gutter_overlay(self, host_widget, qt_widget):
-        key = id(qt_widget)
-        overlay = self.gutter_overlays.get(key)
-
-        recreate = False
-        if overlay is None:
-            recreate = True
-        else:
-            try:
-                if overlay.parentWidget() is not host_widget:
-                    recreate = True
-            except Exception:
-                recreate = True
-
-        if recreate:
-            if overlay is not None:
-                try:
-                    overlay.hide()
-                    overlay.deleteLater()
-                except Exception:
-                    pass
-
-            overlay = GutterLineOverlay(host_widget, self, qt_widget)
-            self.gutter_overlays[key] = overlay
-
-        try:
-            overlay.set_jump_source_widget(qt_widget)
-        except Exception:
-            pass
-
-        self._install_filter_once(host_widget, ("gutter-host", key))
-        self._install_filter_once(qt_widget, ("gutter-view", key))
-        return overlay
-
-    def _hide_gutter_for(self, qt_widget):
-        key = id(qt_widget)
-        overlay = self.gutter_overlays.get(key)
-        if overlay is not None:
-            try:
-                overlay.hide()
-            except Exception:
-                pass
 
 
     def _find_vertical_scrollbar(self, qt_widget):
@@ -4436,7 +3870,6 @@ class ScopeStickyManager:
             return False
 
         self.jump_in_progress = True
-        timer_was_active = False
         jumped = False
         used_method = "none"
 
@@ -4479,13 +3912,6 @@ class ScopeStickyManager:
                         print("[%s] push back stack failed: %s" % (PLUGIN_NAME, e))
                     except Exception:
                         pass
-
-            try:
-                timer_was_active = self.timer.isActive()
-                if timer_was_active:
-                    self.timer.stop()
-            except Exception:
-                timer_was_active = False
 
             try:
                 ida_kernwin.activate_widget(twidget, True)
@@ -4561,11 +3987,6 @@ class ScopeStickyManager:
             return jumped
 
         finally:
-            try:
-                if timer_was_active and not self.timer.isActive():
-                    self.timer.start()
-            except Exception:
-                pass
             self.jump_in_progress = False
 
     def _make_parser_from_cfunc(self, cfunc):
@@ -4659,27 +4080,68 @@ class ScopeStickyManager:
             pass
         return 0
 
-    def _scrollbar_top_line(self, qt_widget, total_lines, fallback):
-        if not USE_SCROLLBAR_TOP_LINE:
-            return fallback
+    def _cached_code_line_height(self, qt_widget):
+        if not self._qt_widget_alive(qt_widget):
+            return ROW_HEIGHT_DEFAULT
+
+        try:
+            font_key = qt_widget.font().toString()
+        except Exception:
+            font_key = ""
+
+        key = (id(qt_widget), font_key)
+        cached = self._row_height_cache.get(key)
+        if cached is not None:
+            return _clamp_row_height(cached)
+
+        row_height = _estimate_code_line_height(qt_widget)
+        self._row_height_cache[key] = row_height
+        return row_height
+
+    def _cached_vertical_scrollbar(self, qt_widget):
+        if not self._qt_widget_alive(qt_widget):
+            return None
+
+        key = id(qt_widget)
+        cached = self._scrollbar_cache.get(key)
+        if cached is not None:
+            try:
+                if self._qt_widget_alive(cached) and cached.isVisible() and cached.orientation() == QtCore.Qt.Vertical and cached.maximum() > 0:
+                    return cached
+            except Exception:
+                pass
+            try:
+                del self._scrollbar_cache[key]
+            except Exception:
+                pass
 
         try:
             scrollbars = qt_widget.findChildren(QtWidgets.QScrollBar)
         except Exception:
-            return fallback
+            return None
 
         candidates = []
         for sb in scrollbars:
             try:
-                if sb.isVisible() and sb.orientation() == QtCore.Qt.Vertical and sb.maximum() > 0:
+                if self._qt_widget_alive(sb) and sb.isVisible() and sb.orientation() == QtCore.Qt.Vertical and sb.maximum() > 0:
                     candidates.append(sb)
             except Exception:
                 pass
 
         if not candidates:
-            return fallback
+            return None
 
         sb = max(candidates, key=lambda x: x.maximum())
+        self._scrollbar_cache[key] = sb
+        return sb
+
+    def _scrollbar_top_line(self, qt_widget, total_lines, fallback):
+        if not USE_SCROLLBAR_TOP_LINE:
+            return fallback
+
+        sb = self._cached_vertical_scrollbar(qt_widget)
+        if sb is None:
+            return fallback
 
         try:
             value = int(sb.value())
@@ -4874,6 +4336,7 @@ class ScopeStickyManager:
 
         root_qt_widget = self._twidget_to_qwidget(twidget)
         if root_qt_widget is None:
+            _debug("hide overlay: current pseudocode TWidget could not be converted to QWidget")
             self.hide_all()
             return
 
@@ -4881,20 +4344,9 @@ class ScopeStickyManager:
         if qt_widget is None:
             qt_widget = root_qt_widget
 
-        integrated_code_x = None
-        integrated_code_y = None
-        top_level_overlay = bool(USE_SCREEN_STICKY_OVERLAY)
-        if top_level_overlay:
-            overlay_parent = qt_widget
-            current_key = ("screen", id(qt_widget))
-        elif USE_INTEGRATED_ROOT_OVERLAY:
-            # IDA 9.2 fallback path: parent the overlay to the stable ancestor
-            # that contains the original line-number gutter.
-            overlay_parent, integrated_code_x, integrated_code_y = self._select_true_gutter_overlay_host(root_qt_widget, qt_widget)
-            current_key = id(overlay_parent)
-        else:
-            overlay_parent = qt_widget
-            current_key = id(overlay_parent)
+        top_level_overlay = True
+        overlay_parent = qt_widget
+        current_key = ("screen", id(qt_widget))
 
         self._remember_overlay_root(overlay_parent, root_qt_widget, twidget)
         self._remember_overlay_root(root_qt_widget, root_qt_widget, twidget)
@@ -4909,85 +4361,46 @@ class ScopeStickyManager:
             return
 
         if parser is None or total_lines <= 0:
+            _debug("hide overlay: parser is empty or pseudocode has no lines")
             self.hide_all()
             return
 
         try:
-            row_height = _estimate_code_line_height(qt_widget)
+            row_height = self._cached_code_line_height(qt_widget)
             cursor_line = self._cursor_line(vu)
             top_line = self._scrollbar_top_line(root_qt_widget, total_lines, cursor_line)
             scopes, _touch_line = self._select_scopes_by_bottom_touch(parser, top_line, total_lines)
-        except Exception:
+            if not scopes and 0 <= cursor_line < total_lines:
+                scopes = parser.active_at(cursor_line, trim=True)
+        except Exception as e:
+            _debug("hide overlay: scope selection failed: %s" % e)
             self.hide_all()
             return
 
-        overlay = self._get_overlay(overlay_parent, top_level=top_level_overlay)
-        if top_level_overlay:
-            geom_rect, gutter_width, text_offset = self._make_screen_overlay_geometry(
-                qt_widget,
-                row_height,
-                len(scopes),
-                total_lines,
-            )
-            overlay.set_scopes(
-                scopes,
-                row_height,
-                geom_rect=geom_rect,
-                source_font=qt_widget.font(),
-                gutter_width=gutter_width,
-                text_offset=text_offset,
-                draw_gutter=ENABLE_GUTTER_LINE_OVERLAY,
-            )
-            self._hide_gutter_for(qt_widget)
-            self._hide_gutter_for(overlay_parent)
-        elif USE_INTEGRATED_ROOT_OVERLAY:
-            geom_rect, gutter_width, text_offset = self._make_root_overlay_geometry(
-                overlay_parent,
-                qt_widget,
-                row_height,
-                len(scopes),
-                total_lines,
-                integrated_code_x,
-                integrated_code_y,
-            )
-            overlay.set_scopes(
-                scopes,
-                row_height,
-                geom_rect=geom_rect,
-                source_font=qt_widget.font(),
-                gutter_width=gutter_width,
-                text_offset=text_offset,
-                draw_gutter=ENABLE_GUTTER_LINE_OVERLAY,
-            )
-            # The integrated overlay already draws line numbers, so the old
-            # standalone gutter overlay must be hidden to avoid drifting panels.
-            self._hide_gutter_for(qt_widget)
-            self._hide_gutter_for(overlay_parent)
-        else:
-            overlay.set_scopes(scopes, row_height, source_font=qt_widget.font())
+        if not scopes:
+            _debug("hide overlay: no active scope at top_line=%s cursor_line=%s total_lines=%s" % (top_line, cursor_line, total_lines))
+            self.hide_all()
+            return
 
-            if ENABLE_GUTTER_LINE_OVERLAY:
-                host_widget, gutter_rect = self._find_gutter_host_and_rect(
-                    qt_widget,
-                    row_height,
-                    total_lines,
-                    len(scopes),
-                    root_qt_widget,
-                )
-
-                if host_widget is not None and gutter_rect.isValid():
-                    gutter_overlay = self._get_gutter_overlay(host_widget, qt_widget)
-                    gutter_overlay.set_scopes(
-                        scopes,
-                        row_height,
-                        total_lines,
-                        gutter_rect,
-                        qt_widget.font(),
-                    )
-                else:
-                    self._hide_gutter_for(qt_widget)
-            else:
-                self._hide_gutter_for(qt_widget)
+        overlay = self._get_overlay(overlay_parent, top_level=True)
+        if overlay is None:
+            self.hide_all()
+            return
+        geom_rect, gutter_width, text_offset = self._make_screen_overlay_geometry(
+            qt_widget,
+            row_height,
+            len(scopes),
+            total_lines,
+        )
+        overlay.set_scopes(
+            scopes,
+            row_height,
+            geom_rect=geom_rect,
+            source_font=qt_widget.font(),
+            gutter_width=gutter_width,
+            text_offset=text_offset,
+            draw_gutter=ENABLE_GUTTER_LINE_OVERLAY,
+        )
 
 
 class ScopeStickyPlugmod(ida_idaapi.plugmod_t):
@@ -5008,12 +4421,12 @@ class ScopeStickyPlugmod(ida_idaapi.plugmod_t):
         if IMPORT_NAME_CACHE is not None:
             print("[%s] import names loaded: %d" % (PLUGIN_NAME, len(IMPORT_NAME_CACHE)))
 
-        print("[%s] loaded %s, IDA=%s, Qt=%s, safe_mode=%s, text_rewrite=%s" % (
+        print("[%s] loaded %s, IDA=%s, Qt=%s, ida92_only=%s, text_rewrite=%s" % (
             PLUGIN_NAME,
             PLUGIN_VERSION,
             IDA_VERSION_TEXT,
             QT_BINDING,
-            str(bool(IDA92_SAFE_MODE)),
+            str(bool(IDA92_ONLY)),
             str(bool(ENABLE_HEXRAYS_TEXT_REWRITE)),
         ))
 
@@ -5040,6 +4453,9 @@ class ScopeStickyPlugin(ida_idaapi.plugin_t):
     wanted_hotkey = ""
 
     def init(self):
+        if not IDA_GE_92:
+            print("[%s] unsupported IDA version: %s. This build requires IDA 9.2 or newer." % (PLUGIN_NAME, IDA_VERSION_TEXT))
+            return None
         if QtWidgets is None:
             print("[%s] Qt binding is not available" % PLUGIN_NAME)
             return None
