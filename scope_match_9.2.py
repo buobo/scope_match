@@ -70,7 +70,7 @@ IDA92_ONLY = True
 
 
 PLUGIN_NAME = "scope_match"
-PLUGIN_VERSION = "v28-ida92-sync-90-perf-no-scan-20260501"
+PLUGIN_VERSION = "v29-ida92-sync-90-app-focus-overlay-20260501"
 BACK_JUMP_STACK_MAX = 10
 BACK_JUMP_STACK = []
 TARGET_LINE_BELOW_STICKY_OVERLAY = True
@@ -2187,13 +2187,15 @@ class StickyOverlay(QtWidgets.QWidget):
     def make_screen_overlay(self):
         self._screen_overlay = True
         try:
-            flags = QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint
+            # Do not use WindowStaysOnTopHint here. The overlay is a screen-level
+            # tool window only because IDA 9.2/Qt6 cannot reliably cover the
+            # Hex-Rays line-number gutter with a child widget. A global
+            # always-on-top flag would make the sticky panel float above other
+            # applications after IDA loses focus.
+            flags = QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint
             self.setWindowFlags(flags)
         except Exception:
-            try:
-                self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint)
-            except Exception:
-                pass
+            pass
         try:
             self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         except Exception:
@@ -2520,6 +2522,32 @@ class StickyOverlay(QtWidgets.QWidget):
 
 
 
+class IDAApplicationEventFilter(QtCore.QObject):
+    def __init__(self, manager):
+        super().__init__()
+        self.manager_ref = weakref.ref(manager)
+
+    def eventFilter(self, obj, event):
+        manager = self.manager_ref()
+        if manager is None:
+            return False
+
+        try:
+            et = event.type()
+        except Exception:
+            return False
+
+        try:
+            if et in (QtCore.QEvent.ApplicationDeactivate,):
+                manager.hide_all()
+            elif et in (QtCore.QEvent.ApplicationActivate,):
+                manager.request_update()
+        except Exception:
+            pass
+
+        return False
+
+
 class PseudoWidgetEventFilter(QtCore.QObject):
     def __init__(self, manager):
         super().__init__()
@@ -2652,6 +2680,8 @@ class ScopeStickyManager:
         self._row_height_cache = {}
         self._scrollbar_cache = {}
         self._converter_error_once = set()
+        self.app_event_filter = None
+        self._app_state_connected = False
         self.jump_in_progress = False
         self.update_pending = False
         self.in_update_active = False
@@ -2665,11 +2695,57 @@ class ScopeStickyManager:
         _ensure_css_loaded()
         _build_import_caches()
         self.ensure_hexrays()
+        self._install_application_focus_hooks()
 
         # No periodic timer scan: updates are driven by UI/Hex-Rays events.
 
         print("[%s] %s manager initialized" % (PLUGIN_NAME, PLUGIN_VERSION))
         self.request_update()
+
+    def _application_is_active(self):
+        if QtWidgets is None or QtCore is None:
+            return True
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is None:
+                return True
+            state = app.applicationState()
+            return state == QtCore.Qt.ApplicationActive
+        except Exception:
+            return True
+
+    def _install_application_focus_hooks(self):
+        if QtWidgets is None or QtCore is None:
+            return
+        try:
+            app = QtWidgets.QApplication.instance()
+        except Exception:
+            app = None
+        if app is None:
+            return
+
+        if self.app_event_filter is None:
+            self.app_event_filter = IDAApplicationEventFilter(self)
+            try:
+                app.installEventFilter(self.app_event_filter)
+            except Exception:
+                self.app_event_filter = None
+
+        if not self._app_state_connected:
+            try:
+                app.applicationStateChanged.connect(self._on_application_state_changed)
+                self._app_state_connected = True
+            except Exception:
+                self._app_state_connected = False
+
+    def _on_application_state_changed(self, state):
+        try:
+            if state == QtCore.Qt.ApplicationActive:
+                self.request_update()
+            else:
+                self.hide_all()
+        except Exception:
+            pass
 
     def invalidate_cache(self):
         self.cache_key = None
@@ -2690,6 +2766,24 @@ class ScopeStickyManager:
                 pass
             self.hex_hooks = None
 
+        try:
+            app = QtWidgets.QApplication.instance() if QtWidgets is not None else None
+        except Exception:
+            app = None
+        if app is not None:
+            if self.app_event_filter is not None:
+                try:
+                    app.removeEventFilter(self.app_event_filter)
+                except Exception:
+                    pass
+            if self._app_state_connected:
+                try:
+                    app.applicationStateChanged.disconnect(self._on_application_state_changed)
+                except Exception:
+                    pass
+        self.app_event_filter = None
+        self._app_state_connected = False
+
         for overlay in list(self.overlays.values()):
             try:
                 overlay.hide()
@@ -2708,6 +2802,9 @@ class ScopeStickyManager:
 
     def request_update(self, *args, **kwargs):
         if QtCore is None:
+            return
+        if not self._application_is_active():
+            self.hide_all()
             return
         if self.jump_in_progress or self.in_text_coloring:
             return
@@ -4282,6 +4379,9 @@ class ScopeStickyManager:
 
     def update_active(self):
         if QtWidgets is None:
+            return
+        if not self._application_is_active():
+            self.hide_all()
             return
         if self.jump_in_progress or self.in_text_coloring:
             return
