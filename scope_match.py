@@ -51,7 +51,7 @@ except Exception:
 
 
 PLUGIN_NAME = "Scope Sticky Braces"
-PLUGIN_VERSION = "v9-back-stack-20260429-event-sources-min-backkey"
+PLUGIN_VERSION = "v16-line-font-exact-92-20260501"
 BACK_JUMP_STACK_MAX = 10
 BACK_JUMP_STACK = []
 TARGET_LINE_BELOW_STICKY_OVERLAY = True
@@ -91,6 +91,7 @@ GUTTER_DETECT_MAX_TOP = 32
 GUTTER_DETECT_MAX_DEPTH = 5
 
 USE_SCROLLBAR_TOP_LINE = True
+UPDATE_DEBOUNCE_MS = 0
 BOTTOM_TOUCH_PROMOTION = True
 ENABLE_HEXRAYS_BRACE_COLOR = True
 ENABLE_STICKY_COLORED_TEXT = True
@@ -169,6 +170,16 @@ except Exception:
         QtGui = None
         QtWidgets = None
         QT_BINDING = None
+
+try:
+    import sip
+except Exception:
+    sip = None
+
+try:
+    import shiboken6
+except Exception:
+    shiboken6 = None
 
 
 def _const_value(name, fallback=None):
@@ -2273,8 +2284,20 @@ class StickyOverlay(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def set_scopes(self, scopes, row_height):
+    def set_scopes(self, scopes, row_height, source_font=None):
         self.set_row_height(row_height)
+
+        # Match IDA 9.2 behavior: sticky text and gutter numbers use the
+        # actual pseudocode view font supplied by update_active(), not the
+        # overlay parent/widget font. This is important on IDA 9.0 because
+        # the selected overlay parent can be a container/gutter widget whose
+        # font differs from the Hex-Rays code view font.
+        if source_font is not None:
+            try:
+                self.font = QtGui.QFont(source_font)
+            except Exception:
+                pass
+
         self.scopes = scopes
         if len(self._doc_cache) > 256:
             self._doc_cache.clear()
@@ -2546,35 +2569,31 @@ class PseudoWidgetEventFilter(QtCore.QObject):
         if manager is None:
             return False
 
-        event_type = event.type()
-
-        if event_type == QtCore.QEvent.KeyPress:
-            try:
+        try:
+            if event.type() == QtCore.QEvent.KeyPress:
                 if manager.handle_back_key(obj, event):
                     return True
-            except Exception as e:
-                try:
-                    print("[%s] back key handler failed: %s" % (PLUGIN_NAME, e))
-                except Exception:
-                    pass
-            return False
-
-        window_events = {
-            QtCore.QEvent.Resize,
-            QtCore.QEvent.Show,
-            QtCore.QEvent.Hide,
-            QtCore.QEvent.Move,
-        }
-
-        if event_type in window_events:
+        except Exception as e:
             try:
-                manager.invalidate_widget_geometry(obj)
+                print("[%s] back key handler failed: %s" % (PLUGIN_NAME, e))
             except Exception:
                 pass
-            manager.request_update()
-            return False
 
-        if event_type == QtCore.QEvent.MouseButtonRelease:
+        watched_events = {
+            QtCore.QEvent.Wheel,
+            QtCore.QEvent.Resize,
+            QtCore.QEvent.Show,
+            QtCore.QEvent.Move,
+            QtCore.QEvent.KeyPress,
+            QtCore.QEvent.MouseButtonPress,
+            QtCore.QEvent.MouseButtonRelease,
+        }
+
+        scroll_event = getattr(QtCore.QEvent, "Scroll", None)
+        if scroll_event is not None:
+            watched_events.add(scroll_event)
+
+        if event.type() in watched_events:
             manager.request_update()
 
         return False
@@ -2588,19 +2607,16 @@ class ScopeStickyUIHooks(ida_kernwin.UI_Hooks):
     def current_widget_changed(self, widget, prev_widget):
         manager = self.manager_ref()
         if manager is not None:
-            manager.invalidate_widget_geometry()
             manager.request_update()
 
     def widget_visible(self, widget):
         manager = self.manager_ref()
         if manager is not None:
-            manager.invalidate_widget_geometry()
             manager.request_update()
 
     def widget_invisible(self, widget):
         manager = self.manager_ref()
         if manager is not None:
-            manager.invalidate_widget_geometry()
             manager.request_update()
 
 
@@ -2654,19 +2670,6 @@ class ScopeStickyHexraysHooks(ida_hexrays.Hexrays_Hooks):
     def close_pseudocode(self, vu):
         manager = self.manager_ref()
         if manager is not None:
-            try:
-                cfunc = vu.cfunc
-                entry = int(cfunc.entry_ea)
-                manager._clear_brace_color_state(entry)
-            except Exception:
-                pass
-            try:
-                manager.invalidate_cache()
-                manager.invalidate_widget_geometry()
-                manager.hide_all()
-                manager._cleanup_dead_scrollbar_connections()
-            except Exception:
-                pass
             manager.request_update()
         return 0
 
@@ -2681,8 +2684,12 @@ class ScopeStickyManager:
         self.gutter_overlays = {}
         self.filters = {}
         self.qt_to_twidget = {}
+        self.overlay_to_root = {}
+        self.root_to_overlay_parent = {}
         self.jump_in_progress = False
         self._update_pending = False
+        self.update_pending = False
+        self.in_update_active = False
         self.row_height_cache = {}
         self.scrollbar_cache = {}
         self.gutter_geometry_cache = {}
@@ -2744,8 +2751,12 @@ class ScopeStickyManager:
         self.gutter_overlays.clear()
         self.filters.clear()
         self.qt_to_twidget.clear()
+        self.overlay_to_root.clear()
+        self.root_to_overlay_parent.clear()
         self.row_height_cache.clear()
         self._update_pending = False
+        self.update_pending = False
+        self.in_update_active = False
         for sb, callback in list(self.scrollbar_signal_cache.values()):
             try:
                 sb.valueChanged.disconnect(callback)
@@ -2759,31 +2770,39 @@ class ScopeStickyManager:
         self.brace_color_verified_tag.clear()
         self.brace_color_recolor_pending.clear()
 
-    def request_update(self):
-        if getattr(self, "_update_pending", False):
+    def request_update(self, *args, **kwargs):
+        if QtCore is None:
+            return
+        if self.jump_in_progress or self.in_text_coloring:
+            return
+        if self.update_pending:
             return
 
+        self.update_pending = True
         self._update_pending = True
-        manager_ref = weakref.ref(self)
-
-        def _run_update(mref=manager_ref):
-            manager = mref()
-            if manager is None:
-                return
-
-            manager._update_pending = False
-            try:
-                manager.update_active()
-            except Exception as e:
-                try:
-                    print("[%s] update_active failed: %s" % (PLUGIN_NAME, e))
-                except Exception:
-                    pass
+        delay_ms = UPDATE_DEBOUNCE_MS
+        try:
+            if "delay_ms" in kwargs and kwargs["delay_ms"] is not None:
+                delay_ms = int(kwargs["delay_ms"])
+        except Exception:
+            delay_ms = UPDATE_DEBOUNCE_MS
 
         try:
-            QtCore.QTimer.singleShot(0, _run_update)
+            QtCore.QTimer.singleShot(max(0, delay_ms), self._run_update_active)
         except Exception:
+            self.update_pending = False
             self._update_pending = False
+
+    def _run_update_active(self):
+        self.update_pending = False
+        self._update_pending = False
+        if self.in_update_active or self.jump_in_progress or self.in_text_coloring:
+            return
+        self.in_update_active = True
+        try:
+            self.update_active()
+        finally:
+            self.in_update_active = False
 
     def _cleanup_dead_scrollbar_connections(self):
         for key, pair in list(self.scrollbar_signal_cache.items()):
@@ -2862,18 +2881,193 @@ class ScopeStickyManager:
 
     def _twidget_to_qwidget(self, twidget):
         try:
+            widget = None
             if QT_BINDING == "PyQt5":
-                return ida_kernwin.PluginForm.TWidgetToPyQtWidget(twidget)
-            if QT_BINDING == "PySide6":
+                widget = ida_kernwin.PluginForm.TWidgetToPyQtWidget(twidget)
+            elif QT_BINDING == "PySide6":
                 if hasattr(ida_kernwin.PluginForm, "TWidgetToPySideWidget"):
-                    return ida_kernwin.PluginForm.TWidgetToPySideWidget(twidget)
-                return ida_kernwin.PluginForm.TWidgetToPyQtWidget(twidget)
+                    widget = ida_kernwin.PluginForm.TWidgetToPySideWidget(twidget)
+                else:
+                    widget = ida_kernwin.PluginForm.TWidgetToPyQtWidget(twidget)
+            if widget is not None and self._qt_widget_alive(widget):
+                return widget
             return None
         except Exception:
             return None
 
-    def _install_filter_once(self, widget, key):
+    def _qt_widget_alive(self, widget):
         if widget is None:
+            return False
+        if sip is not None:
+            try:
+                if sip.isdeleted(widget):
+                    return False
+            except Exception:
+                pass
+        if shiboken6 is not None:
+            try:
+                if not shiboken6.isValid(widget):
+                    return False
+            except Exception:
+                pass
+        try:
+            widget.objectName()
+        except RuntimeError:
+            return False
+        except Exception:
+            pass
+        return True
+
+    def _is_child_of(self, child, root):
+        if not self._qt_widget_alive(child) or not self._qt_widget_alive(root):
+            return False
+        w = child
+        depth = 0
+        while w is not None and depth < 32:
+            if w is root:
+                return True
+            try:
+                w = w.parentWidget()
+            except Exception:
+                return False
+            depth += 1
+        return False
+
+    def _widget_score_for_overlay_parent(self, w):
+        if not self._qt_widget_alive(w):
+            return -1
+        try:
+            if isinstance(w, (QtWidgets.QScrollBar, QtWidgets.QMenuBar, QtWidgets.QStatusBar)):
+                return -1
+        except Exception:
+            pass
+        try:
+            if not w.isVisible():
+                return -1
+        except Exception:
+            pass
+        try:
+            width = int(w.width())
+            height = int(w.height())
+        except Exception:
+            return -1
+        if width < 120 or height < 80:
+            return -1
+
+        score = width * height
+        try:
+            cls = str(w.metaObject().className()).lower()
+        except Exception:
+            cls = ""
+        try:
+            obj = str(w.objectName()).lower()
+        except Exception:
+            obj = ""
+
+        name_blob = cls + " " + obj
+        if "customidamemo" in name_blob or "idamemo" in name_blob:
+            score += 100000000
+        if "pseudocode" in name_blob or "hex" in name_blob:
+            score += 50000000
+        if "viewer" in name_blob or "view" in name_blob:
+            score += 10000000
+
+        try:
+            for sb in w.findChildren(QtWidgets.QScrollBar):
+                if sb.isVisible() and sb.orientation() == QtCore.Qt.Vertical:
+                    score += 5000000
+                    break
+        except Exception:
+            pass
+
+        return score
+
+    def _select_overlay_parent(self, root_widget):
+        if not self._qt_widget_alive(root_widget):
+            return None
+
+        cache_key = id(root_widget)
+        cached = self.root_to_overlay_parent.get(cache_key)
+        if cached is not None:
+            try:
+                if self._qt_widget_alive(cached) and cached.isVisible() and self._is_child_of(cached, root_widget):
+                    return cached
+            except Exception:
+                pass
+            try:
+                del self.root_to_overlay_parent[cache_key]
+            except Exception:
+                pass
+
+        best = root_widget
+        best_score = self._widget_score_for_overlay_parent(root_widget)
+        try:
+            children = root_widget.findChildren(QtWidgets.QWidget)
+        except Exception:
+            children = []
+        try:
+            root_w = int(root_widget.width())
+        except Exception:
+            root_w = 0
+        for child in children:
+            if not self._qt_widget_alive(child):
+                continue
+            try:
+                if isinstance(child, (StickyOverlay, GutterLineOverlay, QtWidgets.QScrollBar)):
+                    continue
+            except Exception:
+                pass
+            s = self._widget_score_for_overlay_parent(child)
+            if s <= 0:
+                continue
+            try:
+                local = root_widget.mapFromGlobal(child.mapToGlobal(QtCore.QPoint(0, 0)))
+                child_x = int(local.x())
+                child_y = int(local.y())
+                child_w = int(child.width())
+            except Exception:
+                child_x = 0
+                child_y = 0
+                child_w = 0
+            if root_w > 0 and child_x > int(root_w * 0.35):
+                s -= 200000000
+            if child_y > 80:
+                s -= 60000000
+            if 20 <= child_x <= max(220, GUTTER_DETECT_MAX_LEFT * 2):
+                s += 60000000
+            if root_w > 0 and child_w >= int(root_w * 0.45):
+                s += 40000000
+            if s > best_score:
+                best = child
+                best_score = s
+        if best is None:
+            best = root_widget
+        try:
+            self.root_to_overlay_parent[cache_key] = best
+        except Exception:
+            pass
+        return best
+
+    def _remember_overlay_root(self, overlay_parent, root_widget, twidget):
+        if overlay_parent is None:
+            return
+        try:
+            self.overlay_to_root[id(overlay_parent)] = root_widget if root_widget is not None else overlay_parent
+        except Exception:
+            pass
+        if twidget is not None:
+            try:
+                self.qt_to_twidget[id(overlay_parent)] = twidget
+            except Exception:
+                pass
+            if root_widget is not None:
+                try:
+                    self.qt_to_twidget[id(root_widget)] = twidget
+                except Exception:
+                    pass
+
+    def _install_filter_once(self, widget, key):
+        if not self._qt_widget_alive(widget):
             return
 
         pair_key = (id(widget), key)
@@ -2881,7 +3075,12 @@ class ScopeStickyManager:
             return
 
         event_filter = PseudoWidgetEventFilter(self)
-        widget.installEventFilter(event_filter)
+        try:
+            widget.installEventFilter(event_filter)
+        except RuntimeError:
+            return
+        except Exception:
+            return
         self.filters[pair_key] = event_filter
 
     def _connect_scrollbar_value_changed(self, scrollbar):
@@ -2966,20 +3165,21 @@ class ScopeStickyManager:
             return None
 
     def _cached_code_line_height(self, qt_widget):
-        key = id(qt_widget)
-        font_key = self._widget_font_cache_key(qt_widget)
+        if not self._qt_widget_alive(qt_widget):
+            return ROW_HEIGHT_DEFAULT
 
+        try:
+            font_key = qt_widget.font().toString()
+        except Exception:
+            font_key = ""
+
+        key = (id(qt_widget), font_key)
         cached = self.row_height_cache.get(key)
         if cached is not None:
-            try:
-                cached_widget, cached_font_key, cached_height = cached
-                if cached_widget is qt_widget and cached_font_key == font_key:
-                    return _clamp_row_height(cached_height)
-            except Exception:
-                pass
+            return _clamp_row_height(cached)
 
         row_height = _estimate_code_line_height(qt_widget)
-        self.row_height_cache[key] = (qt_widget, font_key, row_height)
+        self.row_height_cache[key] = row_height
         return row_height
 
     def _find_gutter_host_and_rect(self, qt_widget, row_height, total_lines, scope_count):
@@ -3862,6 +4062,15 @@ class ScopeStickyManager:
             except Exception:
                 pass
 
+            # Match the IDA 9.2 behavior: after a sticky jump or B-back jump
+            # finishes, refresh the overlay once so the sticky rows are rebuilt
+            # for the post-jump viewport instead of waiting for the next user
+            # input event. request_update is delayed until jump_in_progress has
+            # already been cleared by the finally block.
+            try:
+                QtCore.QTimer.singleShot(100, self.request_update)
+            except Exception:
+                pass
 
             return jumped
 
@@ -4188,11 +4397,48 @@ class ScopeStickyManager:
             pass
         return 0
 
+    def _cached_vertical_scrollbar(self, qt_widget):
+        if not self._qt_widget_alive(qt_widget):
+            return None
+
+        key = id(qt_widget)
+        cached = self.scrollbar_cache.get(key)
+        if cached is not None:
+            try:
+                if self._qt_widget_alive(cached) and cached.isVisible() and cached.orientation() == QtCore.Qt.Vertical and cached.maximum() > 0:
+                    return cached
+            except Exception:
+                pass
+            try:
+                del self.scrollbar_cache[key]
+            except Exception:
+                pass
+
+        try:
+            scrollbars = qt_widget.findChildren(QtWidgets.QScrollBar)
+        except Exception:
+            return None
+
+        candidates = []
+        for sb in scrollbars:
+            try:
+                if self._qt_widget_alive(sb) and sb.isVisible() and sb.orientation() == QtCore.Qt.Vertical and sb.maximum() > 0:
+                    candidates.append(sb)
+            except Exception:
+                pass
+
+        if not candidates:
+            return None
+
+        sb = max(candidates, key=lambda x: x.maximum())
+        self.scrollbar_cache[key] = sb
+        return sb
+
     def _scrollbar_top_line(self, qt_widget, total_lines, fallback):
         if not USE_SCROLLBAR_TOP_LINE:
             return fallback
 
-        sb = self._find_vertical_scrollbar(qt_widget)
+        sb = self._cached_vertical_scrollbar(qt_widget)
         if sb is None:
             return fallback
 
@@ -4336,6 +4582,8 @@ class ScopeStickyManager:
     def update_active(self):
         if QtWidgets is None:
             return
+        if self.jump_in_progress or self.in_text_coloring:
+            return
 
         try:
             twidget = ida_kernwin.get_current_widget()
@@ -4385,14 +4633,21 @@ class ScopeStickyManager:
         except Exception:
             pass
 
-        qt_widget = self._twidget_to_qwidget(twidget)
-        if qt_widget is None:
+        root_qt_widget = self._twidget_to_qwidget(twidget)
+        if root_qt_widget is None:
             self.hide_all()
             return
 
+        qt_widget = self._select_overlay_parent(root_qt_widget)
+        if qt_widget is None:
+            qt_widget = root_qt_widget
+
         current_key = id(qt_widget)
-        self.qt_to_twidget[current_key] = twidget
+        self._remember_overlay_root(qt_widget, root_qt_widget, twidget)
+        self._remember_overlay_root(root_qt_widget, root_qt_widget, twidget)
         self._hide_non_current_overlays(current_key)
+        self._install_filter_once(root_qt_widget, ("root", current_key))
+        self._install_filter_once(qt_widget, ("main", current_key))
 
         try:
             parser, total_lines = self._get_parser_and_total_lines(vu)
@@ -4407,14 +4662,35 @@ class ScopeStickyManager:
         try:
             row_height = self._cached_code_line_height(qt_widget)
             cursor_line = self._cursor_line(vu)
-            top_line = self._scrollbar_top_line(qt_widget, total_lines, cursor_line)
+            top_line = self._scrollbar_top_line(root_qt_widget, total_lines, cursor_line)
             scopes, _touch_line = self._select_scopes_by_bottom_touch(parser, top_line, total_lines)
+            if not scopes and 0 <= cursor_line < total_lines:
+                scopes = parser.active_at(cursor_line, trim=True)
         except Exception:
             self.hide_all()
             return
 
+        if not scopes:
+            self.hide_all()
+            return
+
         overlay = self._get_overlay(qt_widget)
-        overlay.set_scopes(scopes, row_height)
+        overlay.set_scopes(scopes, row_height, source_font=qt_widget.font())
+
+        # Keep the line-number overlay using exactly the same font as the
+        # sticky text overlay. IDA 9.2 draws gutter numbers inside the same
+        # StickyOverlay after assigning source_font=qt_widget.font(), so the
+        # number text and scope text share one QFont. IDA 9.0 still uses a
+        # separate GutterLineOverlay, therefore pass overlay.font instead of
+        # re-reading a possibly different host/widget font.
+        gutter_source_font = None
+        try:
+            gutter_source_font = QtGui.QFont(overlay.font)
+        except Exception:
+            try:
+                gutter_source_font = QtGui.QFont(qt_widget.font())
+            except Exception:
+                gutter_source_font = None
 
         if ENABLE_GUTTER_LINE_OVERLAY:
             host_widget, gutter_rect = self._find_gutter_host_and_rect(
@@ -4431,7 +4707,7 @@ class ScopeStickyManager:
                     row_height,
                     total_lines,
                     gutter_rect,
-                    qt_widget.font(),
+                    gutter_source_font,
                 )
             else:
                 self._hide_gutter_for(qt_widget)
