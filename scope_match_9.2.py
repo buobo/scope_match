@@ -70,7 +70,7 @@ IDA92_ONLY = True
 
 
 PLUGIN_NAME = "scope_match"
-PLUGIN_VERSION = "v29-ida92-sync-90-app-focus-overlay-20260501"
+PLUGIN_VERSION = "v30-ida92-screen-overlay-follow-main-window-20260505"
 BACK_JUMP_STACK_MAX = 10
 BACK_JUMP_STACK = []
 TARGET_LINE_BELOW_STICKY_OVERLAY = True
@@ -128,6 +128,7 @@ IDA92_SKIP_TEXT_REWRITE_ON_REFRESH = True
 UPDATE_DEBOUNCE_MS = 0
 TIMER_UPDATE_INTERVAL_MS = 0
 USE_SCREEN_STICKY_OVERLAY = True
+SCREEN_OVERLAY_MOVE_REFRESH_DELAY_MS = 0
 
 BRACE_SCOLOR_SEQUENCE = [
     "SCOLOR_NUMBER",
@@ -2165,6 +2166,7 @@ class StickyOverlay(QtWidgets.QWidget):
         self.integrated_draw_gutter = False
         self._screen_overlay = False
         self.jump_source_widget_ref = weakref.ref(parent) if parent is not None else (lambda: None)
+        self.last_total_lines = 0
 
         self.setWindowFlags(QtCore.Qt.Widget)
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
@@ -2321,7 +2323,17 @@ class StickyOverlay(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def set_scopes(self, scopes, row_height, geom_rect=None, source_font=None, gutter_width=0, text_offset=0, draw_gutter=False):
+    def set_scopes(self, scopes, row_height, geom_rect=None, source_font=None, gutter_width=0, text_offset=0, draw_gutter=False, source_widget=None, total_lines=0):
+        if source_widget is not None:
+            try:
+                self.set_jump_source_widget(source_widget)
+            except Exception:
+                pass
+        try:
+            if total_lines:
+                self.last_total_lines = int(total_lines)
+        except Exception:
+            pass
         self.set_row_height(row_height)
         self.scopes = scopes
         self.integrated_gutter_width = max(0, int(gutter_width or 0))
@@ -2545,6 +2557,20 @@ class IDAApplicationEventFilter(QtCore.QObject):
         except Exception:
             pass
 
+        # The sticky panel is a parentless screen-level Qt.Tool window.
+        # It must be moved manually whenever the IDA top-level window moves.
+        try:
+            geometry_events = {
+                QtCore.QEvent.Move,
+                QtCore.QEvent.Resize,
+                QtCore.QEvent.WindowStateChange,
+                QtCore.QEvent.Show,
+            }
+            if et in geometry_events and manager._geometry_event_is_relevant(obj):
+                manager.on_relevant_window_geometry_event()
+        except Exception:
+            pass
+
         return False
 
 
@@ -2583,6 +2609,12 @@ class PseudoWidgetEventFilter(QtCore.QObject):
         scroll_event = getattr(QtCore.QEvent, "Scroll", None)
         if scroll_event is not None:
             watched_events.add(scroll_event)
+
+        for name in ("WindowStateChange", "WindowActivate", "WindowDeactivate", "ParentChange", "ZOrderChange"):
+            try:
+                watched_events.add(getattr(QtCore.QEvent, name))
+            except Exception:
+                pass
 
         if event.type() in watched_events:
             manager.request_update()
@@ -2713,6 +2745,112 @@ class ScopeStickyManager:
             return state == QtCore.Qt.ApplicationActive
         except Exception:
             return True
+
+    def _geometry_event_is_relevant(self, widget):
+        if QtWidgets is None:
+            return False
+        if not self._qt_widget_alive(widget):
+            return False
+
+        try:
+            if isinstance(widget, StickyOverlay):
+                return False
+        except Exception:
+            pass
+
+        try:
+            if isinstance(widget, (QtWidgets.QMenu, QtWidgets.QToolTip)):
+                return False
+        except Exception:
+            pass
+
+        roots = []
+        try:
+            roots.extend([root for root in self.overlay_to_root.values() if self._qt_widget_alive(root)])
+        except Exception:
+            pass
+
+        try:
+            for overlay in self.overlays.values():
+                if overlay is None or not bool(getattr(overlay, "_screen_overlay", False)):
+                    continue
+                source = overlay.jump_source_widget_ref()
+                if self._qt_widget_alive(source):
+                    roots.append(source)
+        except Exception:
+            pass
+
+        if not roots:
+            return False
+
+        for root in roots:
+            try:
+                if widget is root:
+                    return True
+                if self._is_child_of(widget, root) or self._is_child_of(root, widget):
+                    return True
+                if widget.isWindow() and root.window() is widget:
+                    return True
+                if widget.window() is root.window():
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def reposition_visible_screen_overlays(self):
+        if QtWidgets is None or QtCore is None:
+            return False
+        moved_any = False
+        for overlay in list(self.overlays.values()):
+            try:
+                if overlay is None or not bool(getattr(overlay, "_screen_overlay", False)):
+                    continue
+                if not overlay.isVisible():
+                    continue
+                source_widget = overlay.jump_source_widget_ref()
+                if not self._qt_widget_alive(source_widget):
+                    overlay.hide()
+                    continue
+                scopes = tuple(getattr(overlay, "scopes", ()) or ())
+                if not scopes:
+                    overlay.hide()
+                    continue
+                row_height = getattr(overlay, "row_height", ROW_HEIGHT_DEFAULT)
+                total_lines = int(getattr(overlay, "last_total_lines", 0) or self.cache_total_lines or 0)
+                geom_rect, gutter_width, text_offset = self._make_screen_overlay_geometry(
+                    source_widget,
+                    row_height,
+                    len(scopes),
+                    total_lines,
+                )
+                overlay.set_scopes(
+                    scopes,
+                    row_height,
+                    geom_rect=geom_rect,
+                    source_font=source_widget.font(),
+                    gutter_width=gutter_width,
+                    text_offset=text_offset,
+                    draw_gutter=ENABLE_GUTTER_LINE_OVERLAY,
+                    source_widget=source_widget,
+                    total_lines=total_lines,
+                )
+                moved_any = True
+            except RuntimeError:
+                try:
+                    overlay.hide()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return moved_any
+
+    def on_relevant_window_geometry_event(self):
+        if not self._application_is_active():
+            self.hide_all()
+            return
+        self.reposition_visible_screen_overlays()
+        self.request_update(delay_ms=SCREEN_OVERLAY_MOVE_REFRESH_DELAY_MS)
 
     def _install_application_focus_hooks(self):
         if QtWidgets is None or QtCore is None:
@@ -3177,6 +3315,22 @@ class ScopeStickyManager:
         except Exception:
             return
         self.filters[pair_key] = event_filter
+
+    def _install_ancestor_move_filters(self, widget, key):
+        cur = widget
+        depth = 0
+        while self._qt_widget_alive(cur) and depth < 24:
+            self._install_filter_once(cur, ("ancestor", key, depth))
+            try:
+                if cur.isWindow():
+                    break
+            except Exception:
+                pass
+            try:
+                cur = cur.parentWidget()
+            except Exception:
+                break
+            depth += 1
 
     def _get_overlay(self, qt_widget, top_level=False):
         if not self._qt_widget_alive(qt_widget):
@@ -4453,6 +4607,8 @@ class ScopeStickyManager:
         self._remember_overlay_root(qt_widget, root_qt_widget, twidget)
         self._hide_non_current_overlays(current_key)
         self._install_filter_once(root_qt_widget, ("root", current_key))
+        self._install_ancestor_move_filters(root_qt_widget, current_key)
+        self._install_ancestor_move_filters(qt_widget, current_key)
 
         try:
             parser, total_lines = self._get_parser_and_total_lines(vu)
@@ -4500,6 +4656,8 @@ class ScopeStickyManager:
             gutter_width=gutter_width,
             text_offset=text_offset,
             draw_gutter=ENABLE_GUTTER_LINE_OVERLAY,
+            source_widget=qt_widget,
+            total_lines=total_lines,
         )
 
 
